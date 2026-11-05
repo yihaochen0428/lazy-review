@@ -140,7 +140,7 @@ const App = {
               搜索中…
             </div>
           </div>
-          <div style="display:flex;align-items:center;gap:7px" class="muted small">
+          <div style="display:flex;align-items:center;gap:7px" class="topbar-meta muted small">
             <span class="status-dot" :class="{ warn: state.error }"></span>
             <span class="num">{{ state.dash ? state.dash.date : '-' }}</span>
           </div>

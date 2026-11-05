@@ -1,12 +1,12 @@
 import { go, loadIndex, state } from "../store.js";
 import { Chart } from "../components.js";
 import { klineOption, intradayOption } from "../charts.js";
-import { fmtPct, fmtPrice, tone } from "../utils.js";
+import { fmtPct, fmtPrice, isMarketOpen, tone } from "../utils.js";
 
 export default {
   components: { Chart },
   setup() {
-    const { computed, ref } = Vue;
+    const { computed, onMounted, onUnmounted, ref } = Vue;
     const indicator = ref("MACD");
     const data = computed(() => state.indexData);
     const loading = computed(() => state.loading);
@@ -30,6 +30,19 @@ export default {
       if (!data.value) return null;
       if (isIntraday.value) return intradayOption(data.value);
       return klineOption(data.value, indicator.value, { waves: data.value.waves, fib: data.value.fib });
+    });
+
+    // 盘中每 30 秒静默刷新一次分时行情；09:25 / 15:00 / 24:00 换挡后分析结论随之更新
+    let timer = null;
+    onMounted(() => {
+      timer = window.setInterval(() => {
+        if (state.route !== "index" || state.indexPeriod !== 105) return;
+        if (!isMarketOpen()) return;
+        loadIndex(state.indexCode, null, { silent: true });
+      }, 30000);
+    });
+    onUnmounted(() => {
+      if (timer) window.clearInterval(timer);
     });
 
     function switchIndex(code) {
@@ -86,7 +99,45 @@ export default {
         </div>
         <span class="tag gold">{{ isIntraday ? '分时行情' : data.period_label + '研判' }}</span>
         <span class="muted small" v-if="!isIntraday">切换周期后，指标、波浪与支撑压力全部按{{ data.period_unit }}K重新计算</span>
-        <span class="muted small" v-else>5 分钟线 · 均价线 · MACD，与个股分时同版式（水上红 / 水下绿）</span>
+        <span class="muted small" v-else>
+          30 秒自动刷新 ·
+          <template v-if="data.analysis">分析 {{ data.analysis.computed_at }} 更新（{{ data.analysis.next_update }} 重算）</template>
+          <template v-else>5 分钟线 · MACD</template>
+        </span>
+      </div>
+
+      <div class="card verdict-card" v-if="isIntraday && data.analysis" style="margin-bottom:14px">
+        <div class="card-head">
+          <div>
+            <div class="card-title">分时研判 · {{ data.analysis.label }}</div>
+            <div class="card-sub">按{{ data.analysis.basis }}指标计算 · {{ data.analysis.computed_at }} 更新 · 下一次 {{ data.analysis.next_update }} 重算</div>
+          </div>
+        </div>
+        <div class="verdict-top">
+          <span class="verdict-badge" :class="data.analysis.tone">{{ data.analysis.direction }}</span>
+          <div class="verdict-meta">
+            现价&nbsp;<b class="num" :class="tone(data.price - data.analysis.support)">{{ fmtPrice(data.price) }}</b><br />
+            近 120 根日K区间 {{ fmtPrice(data.analysis.swing_low) }} ~ {{ fmtPrice(data.analysis.swing_high) }}
+          </div>
+        </div>
+        <div class="verdict-points">
+          <div class="vp">
+            <div class="vp-label">第一支撑</div>
+            <div class="vp-value num down">{{ fmtPrice(data.analysis.support) }}</div>
+          </div>
+          <div class="vp">
+            <div class="vp-label">第一压力</div>
+            <div class="vp-value num up">{{ fmtPrice(data.analysis.resistance) }}</div>
+          </div>
+          <div class="vp">
+            <div class="vp-label">多空评分</div>
+            <div class="vp-value num gold">{{ data.analysis.score }}</div>
+          </div>
+        </div>
+        <div class="advice"><b style="color:#dfe5ef">操作思路：</b>{{ data.analysis.advice }}</div>
+        <ul class="risk-list">
+          <li v-for="risk in data.analysis.risks" :key="risk">{{ risk }}</li>
+        </ul>
       </div>
 
       <section class="verdict-row" v-if="!isIntraday">
@@ -94,7 +145,10 @@ export default {
           <div class="card-head">
             <div>
               <div class="card-title">{{ data.name }} · {{ data.period_label }}技术研判</div>
-              <div class="card-sub">当前点位 {{ fmtPrice(data.price) }} · 综合评分 {{ data.score }}</div>
+              <div class="card-sub">
+                当前点位 {{ fmtPrice(data.price) }} · 综合评分 {{ data.score }}
+                <template v-if="data.analysis"> · 分析 {{ data.analysis.computed_at }} 更新（{{ data.analysis.next_update }} 重算）</template>
+              </div>
             </div>
             <div class="right">
               <button class="ghost-btn" @click="go('dashboard')">← 复盘看板</button>

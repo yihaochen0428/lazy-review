@@ -1,5 +1,6 @@
 """懒得复盘 - 全局配置"""
 import os
+from datetime import datetime
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -19,3 +20,12 @@ LLM_BASE_URL = os.getenv("LAZY_LLM_BASE_URL", "https://api.deepseek.com/v1")
 LLM_API_KEY = os.getenv("LAZY_LLM_API_KEY", "").strip()
 LLM_MODEL = os.getenv("LAZY_LLM_MODEL", "deepseek-chat")
 LLM_TIMEOUT = int(os.getenv("LAZY_LLM_TIMEOUT", "60"))
+
+
+def is_trading_time(now=None) -> bool:
+    """是否处于 A股连续竞价时段（不判节假日，仅用于决定行情缓存时长）"""
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return (9 * 60 + 15 <= minutes <= 11 * 60 + 30) or (13 * 60 <= minutes <= 15 * 60 + 5)

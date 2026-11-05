@@ -8,9 +8,14 @@ from . import news as news_src
 from . import research
 from . import chan as chan_src
 from . import intraday
+from . import tenv
+from . import dkline
+from . import opening
+from . import overview as overview_src
 from . import ths
 from .analysis import (build_ai_review, compute_sentiment, analyze_index, analyze_stock_indicators,
-                       sentiment_history, sentiment_outlook, news_item_analysis, NOISE_CONCEPTS)
+                       build_stock_strategy, sentiment_history, sentiment_outlook, news_item_analysis,
+                       NOISE_CONCEPTS)
 from .config import SNAPSHOT_TTL, HISTORY_SNAPSHOT_TTL
 from .db import snapshot_get, snapshot_put, snapshot_dates, cached_call
 from .indicators import macd, kdj, rsi, ma, fib_levels
@@ -200,7 +205,9 @@ def build_dashboard(date: str = None, force: bool = False):
     target = date or latest
     cached = snapshot_get(target)
     ttl = SNAPSHOT_TTL if target == latest else HISTORY_SNAPSHOT_TTL
-    if cached and not force and time.time() - cached["built_at"] < ttl:
+    phase = analysis_phase()[0]
+    same_phase = (cached or {}).get("payload", {}).get("refresh", {}).get("phase") == phase
+    if cached and not force and same_phase and time.time() - cached["built_at"] < ttl:
         payload = cached["payload"]
         payload["cached"] = True
         return payload
@@ -339,14 +346,24 @@ def build_dashboard(date: str = None, force: bool = False):
             if intra:
                 idx["intra"] = intra
 
+    overview = None
+    if is_latest and breadth and sentiment:
+        try:
+            overview = overview_src.build(breadth, sentiment, breadth["limit_up"],
+                                          breadth["limit_down"], target)
+        except Exception:  # noqa: BLE001
+            overview = None
+
     payload = {
         "date": target,
         "latest_date": latest,
         "is_latest": is_latest,
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "refresh": _analysis_meta(),
         "indices": indices,
         "breadth": breadth,
         "sentiment": sentiment,
+        "overview": overview,
         "sectors": {"industry": industry, "concept": concept},
         "limitup": limitup,
         "ladder": ladder,
@@ -387,6 +404,34 @@ def sector_detail(code: str, sort: str = "f3"):
     }
 
 
+def analysis_phase(now=None):
+    """策略快照时段：09:25 竞价 / 15:00 收盘 / 24:00 隔夜新闻推演，各重算一次"""
+    now = now or datetime.now()
+    minutes = now.hour * 60 + now.minute
+    if minutes < 9 * 60 + 25:
+        return "night", "隔夜推演（00:00 新闻快照）", "09:25"
+    if minutes < 15 * 60:
+        return "auction", "09:25 竞价快照", "15:00"
+    return "close", "15:00 收盘快照", "24:00 隔夜推演"
+
+
+def _analysis_meta():
+    phase, label, next_update = analysis_phase()
+    return {
+        "phase": phase,
+        "label": label,
+        "next_update": next_update,
+        "computed_at": datetime.now().strftime("%H:%M"),
+    }
+
+
+def _session_analysis(scope, code, klt, producer):
+    """同交易日同一时段复用上次结论；跨过 09:25 / 15:00 / 24:00 后自动重算"""
+    phase, _, _ = analysis_phase()
+    key = f"ana9:{scope}:{code}:{klt}:{datetime.now():%Y%m%d}:{phase}"
+    return cached_call(key, 86400, producer)
+
+
 def stock_detail(code: str, klt: int = 101):
     if klt not in (101, 102, 103, 105):
         klt = 101
@@ -407,22 +452,44 @@ def stock_detail(code: str, klt: int = 101):
     k = kdj(highs, lows, closes)
     r = rsi(closes)
     try:
-        indicator = analyze_stock_indicators(meta.get("name") or code, bars)
-    except Exception:  # noqa: BLE001
-        indicator = None
-    try:
         context = _stock_context(code, meta, bars, price)
     except Exception:  # noqa: BLE001
         context = None
-    try:
-        chan = chan_src.analyze(bars, m["dif"])
-    except Exception:  # noqa: BLE001
-        chan = None
     try:
         valuation = _valuation(code, meta, [b["name"] for b in (context or {}).get("boards", [])],
                                (context or {}).get("research"))
     except Exception:  # noqa: BLE001
         valuation = None
+    # 开盘买入决策：指数 / 板块 ETF / 个股竞价强度
+    try:
+        open_advice = opening.advice(meta, [b.get("name") for b in (context or {}).get("boards", [])])
+    except Exception:  # noqa: BLE001
+        open_advice = None
+
+    def build_bundle():
+        ind = analyze_stock_indicators(meta.get("name") or code, bars)
+        try:
+            strategy = build_stock_strategy(bars, ind, valuation)
+        except Exception:  # noqa: BLE001
+            strategy = None
+        return {
+            "indicator": ind,
+            "analysis": _analysis_meta(),
+            # 明日预期与短中期策略跟随收盘快照一起冻结，盘中不反复变动
+            "strategy": strategy,
+        }
+
+    try:
+        bundle = _session_analysis("stk", code, klt, build_bundle)
+    except Exception:  # noqa: BLE001
+        bundle = None
+    indicator = (bundle or {}).get("indicator")
+    analysis = (bundle or {}).get("analysis") or _analysis_meta()
+    strategy = (bundle or {}).get("strategy")
+    try:
+        chan = chan_src.analyze(bars, m["dif"])
+    except Exception:  # noqa: BLE001
+        chan = None
     return {
         "meta": meta,
         "period": klt,
@@ -430,9 +497,12 @@ def stock_detail(code: str, klt: int = 101):
         "fib": fib_levels(swing_high, swing_low, rising),
         "fib_range": {"high": swing_high, "low": swing_low},
         "indicator": indicator,
+        "analysis": analysis,
+        "strategy": strategy,
         "context": context,
         "chan": chan,
         "valuation": valuation,
+        "open_advice": open_advice,
         "series": {
             "ma5": ma(closes, 5), "ma10": ma(closes, 10),
             "ma20": ma(closes, 20), "ma60": ma(closes, 60),
@@ -440,6 +510,16 @@ def stock_detail(code: str, klt: int = 101):
             "k": k["k"], "d": k["d"], "j": k["j"], "rsi": r,
         },
     }
+
+
+def t_backtest(days: int = 10, force: bool = False):
+    """做T策略回测：全信号基准 vs 叠加指数/板块环境后的胜率"""
+    return tenv.backtest(days, force, analysis_phase()[0])
+
+
+def open_backtest(days: int = 20, force: bool = False):
+    """开盘买入建议回测：全部开盘买入 vs 建议买入组的胜率"""
+    return opening.backtest(days, force, analysis_phase()[0])
 
 
 def _intraday_detail(code: str):
@@ -458,11 +538,27 @@ def _intraday_detail(code: str):
     k = kdj(highs, lows, closes)
     r = rsi(closes)
     t_data = intraday.t_points(bars, minute.get("prev_close"), m["dif"])
-    daily = em.fetch_kline(secid, 101, 120)["bars"]
+    # 与日K页共用同一份日线数据，保证两处「八指标」口径一致（同一快照键）
+    daily = em.fetch_kline(secid, 101, 260)["bars"]
     try:
         context = _stock_context(code, meta, daily, price)
     except Exception:  # noqa: BLE001
         context = None
+    # 做T点位叠加当天指数 / 板块 / 个股相对强弱 + T-1 日K 背景
+    try:
+        dk = dkline.state(daily, datetime.now().strftime("%Y-%m-%d"))
+        mkt = dkline.index_daily()
+        env = tenv.build_env(bars, minute.get("prev_close"),
+                             [b.get("name") for b in (context or {}).get("boards", [])], dk, mkt)
+        t_data = tenv.annotate(t_data, env)
+    except Exception:  # noqa: BLE001
+        env = None
+    # 连板/涨停封板日分时波动失真，做T点位不适用
+    limit = tenv.limit_state(daily, code)
+    if limit.get("distorted"):
+        t_data["points"] = []
+        t_data["latest"] = None
+        t_data["summary"] = f"{limit['label']}：连板/封板导致分时指标失真，暂不生成做T点位"
     try:
         chan = chan_src.analyze(daily, macd([b["close"] for b in daily])["dif"])
     except Exception:  # noqa: BLE001
@@ -472,6 +568,32 @@ def _intraday_detail(code: str):
                                (context or {}).get("research"))
     except Exception:  # noqa: BLE001
         valuation = None
+    # 开盘买入决策：指数 / 板块 ETF / 个股竞价强度
+    try:
+        open_advice = opening.advice(meta, [b.get("name") for b in (context or {}).get("boards", [])])
+    except Exception:  # noqa: BLE001
+        open_advice = None
+    # 八指标结论按日线计算，只在 09:25 / 15:00 / 24:00 更新，盘中分时行情照常实时刷新
+
+    def build_bundle():
+        ind = analyze_stock_indicators(meta.get("name") or code, daily)
+        try:
+            strategy = build_stock_strategy(daily, ind, valuation)
+        except Exception:  # noqa: BLE001
+            strategy = None
+        return {
+            "indicator": ind,
+            "analysis": _analysis_meta(),
+            "strategy": strategy,
+        }
+
+    try:
+        bundle = _session_analysis("stk", code, 101, build_bundle)
+    except Exception:  # noqa: BLE001
+        bundle = None
+    indicator = (bundle or {}).get("indicator")
+    analysis = (bundle or {}).get("analysis") or _analysis_meta()
+    strategy = (bundle or {}).get("strategy")
     return {
         "meta": meta,
         "period": 105,
@@ -485,10 +607,16 @@ def _intraday_detail(code: str):
             "summary": t_data["summary"],
             "stats": t_data["stats"],
             "latest": t_data["latest"],
+            "env": env,
+            "limit": limit,
         },
+        "indicator": indicator,
+        "analysis": analysis,
+        "strategy": strategy,
         "context": context,
         "chan": chan,
         "valuation": valuation,
+        "open_advice": open_advice,
         "series": {
             "ma5": ma(closes, 5), "ma10": ma(closes, 10),
             "ma20": ma(closes, 20), "ma60": ma(closes, 60),
@@ -766,6 +894,21 @@ def index_detail(code: str, klt: int = 101):
             raise em.DataError("分时数据不可用")
         closes = [b["close"] for b in bars]
         m = macd(closes)
+        # 分时页也给出研判结论，但按 09:25 / 15:00 / 24:00 三个时点重算，盘中不反复变更
+        daily = em.fetch_kline(meta["secid"], 101, 260)["bars"]
+        try:
+            bundle = _session_analysis("idxintra", meta["code"], 101, lambda: {
+                "analysis": {k: v for k, v in analyze_index(meta["name"], daily, "日").items()
+                             if k in ("direction", "tone", "score", "advice", "risks",
+                                      "support", "resistance", "swing_low", "swing_high")},
+                "meta": _analysis_meta(),
+            })
+        except Exception:  # noqa: BLE001
+            bundle = None
+        analysis = dict((bundle or {}).get("analysis") or {})
+        if analysis:
+            analysis["basis"] = "日线"
+            analysis.update((bundle or {}).get("meta") or _analysis_meta())
         # 指数的成交额/成交量是全市场合计值，比值不是价格，均价线对指数无意义
         return {
             "date": latest_trading_date(),
@@ -778,6 +921,7 @@ def index_detail(code: str, klt: int = 101):
             "period_unit": "分钟",
             "price": closes[-1],
             "intraday": {"bars": bars, "prev_close": minute.get("prev_close"), "vwap": []},
+            "analysis": analysis or None,
             "series": {"dif": m["dif"], "dea": m["dea"], "hist": m["hist"],
                        "change_pct": [b.get("change_pct") for b in bars]},
             "related_news": _index_related_news(meta, klt),
@@ -788,6 +932,17 @@ def index_detail(code: str, klt: int = 101):
     kline = em.fetch_kline(meta["secid"], klt, limit)
     bars = kline["bars"]
     result = analyze_index(meta["name"], bars, unit)
+    # 结论（方向/评分/建议/风险/各指标解读）按 09:25、15:00 与 24:00 的快照复用，盘中不反复变动
+    try:
+        opinion = _session_analysis("idx", meta["code"], klt, lambda: {
+            "direction": result["direction"], "tone": result["tone"], "score": result["score"],
+            "advice": result["advice"], "risks": result["risks"], "sections": result["sections"],
+            "analysis": _analysis_meta(),
+        })
+    except Exception:  # noqa: BLE001
+        opinion = None
+    if opinion:
+        result.update(opinion)
     result.update({
         "code": meta["code"],
         "secid": meta["secid"],
@@ -830,11 +985,19 @@ def news_page():
         "event_window": calendar.get("window"),
         "event_source": calendar.get("source"),
         "analysis": analyze_news(items),
+        "archive": news_src.archive_meta(),
         "filters": {
             "impact": ["利好", "利空", "中性"],
             "scope": ["国内", "国际"],
         },
     }
+
+
+def news_history(days: int = 90, impact: str = "全部", scope: str = "全部",
+                 per_day: int = 6, day: str = ""):
+    """过去 N 天的新闻归档（默认 90 天），带真实日期与利好/利空统计"""
+    days = max(1, min(int(days or 90), 120))
+    return news_src.archive_payload(days, impact, scope, max(1, min(int(per_day or 6), 60)), day or "")
 
 
 def news_analyze(item):
@@ -915,6 +1078,15 @@ def _unusual_producer():
     near.sort(key=lambda x: x["dev"] or 0, reverse=True)
     exiting.sort(key=lambda x: x["remaining"])
 
+    # 异动列表补充当日涨跌幅（腾讯批量，失败不影响主流程）
+    flow_rows = up + near + exiting
+    try:
+        changes = em.fetch_changes([r["code"] for r in flow_rows])
+    except Exception:  # noqa: BLE001
+        changes = {}
+    for row in flow_rows:
+        row["change_pct"] = changes.get(row["code"])
+
     return {
         "date": latest_trading_date(),
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -932,7 +1104,7 @@ def _unusual_producer():
 
 
 def abnormal_list():
-    return cached_call("abnormal:v4", 300, _unusual_producer)
+    return cached_call("abnormal:v5", 300, _unusual_producer)
 
 
 def search_stocks(keyword: str):

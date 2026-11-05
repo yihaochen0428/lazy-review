@@ -1,12 +1,12 @@
 import { go, openSector, openStock, state } from "../store.js";
 import { api } from "../api.js";
-import { Chart, Sparkline, SentimentGauge } from "../components.js";
+import { Chart, Sparkline } from "../components.js";
 import {
   fmtAmount, fmtFlow, fmtPct, fmtPrice, fmtNumber, tone, sparkPath, intraPath,
 } from "../utils.js";
 
 export default {
-  components: { Chart, Sparkline, SentimentGauge },
+  components: { Chart, Sparkline },
   setup() {
     const { computed, ref, watch } = Vue;
     const dash = computed(() => state.dash);
@@ -58,6 +58,29 @@ export default {
     const ladder = computed(() => dash.value?.ladder || null);
     const hotConcepts = computed(() => (dash.value?.limitup?.concepts || []).slice(0, 10));
     const outlook = computed(() => sentiment.value?.outlook || null);
+    const overview = computed(() => dash.value?.overview || null);
+    const refresh = computed(() => dash.value?.refresh || null);
+    const distMax = computed(() => Math.max(1, ...((overview.value?.distribution || []).map((b) => b.count))));
+    const breadthTotal = computed(() => {
+      const o = overview.value;
+      return ((o?.up || 0) + (o?.flat || 0) + (o?.down || 0)) || 1;
+    });
+
+    function distHeight(count) {
+      // 用平方根比例，避免最大档（3000+）把小区间压成一条线
+      if (!count) return "0%";
+      return Math.max(3, Math.round(Math.sqrt(count / distMax.value) * 100)) + "%";
+    }
+
+    function share(n) {
+      return ((n || 0) / breadthTotal.value * 100).toFixed(1);
+    }
+
+    function fmtYi(value, digits = 0) {
+      if (value === null || value === undefined) return "-";
+      return Number(value).toFixed(digits);
+    }
+
     const sentimentOption = computed(() => {
       const history = sentiment.value?.history || [];
       if (!history.length) return null;
@@ -78,7 +101,7 @@ export default {
             const point = history[p.dataIndex] || {};
             return `<div style="font-size:10.5px;color:#a3adc0;margin-bottom:4px">${point.date}</div>
               <div style="font-size:11.5px">情绪温度 <b style="color:#f2b845">${p.value}</b></div>
-              <div style="font-size:11px;color:#8b96a8">指数涨跌 ${point.change_pct > 0 ? "+" : ""}${point.change_pct}%</div>
+              <div style="font-size:11px;color:${point.change_pct > 0 ? "#ff5063" : point.change_pct < 0 ? "#14c39a" : "#8b96a8"}">指数涨跌 ${point.change_pct > 0 ? "+" : ""}${point.change_pct}%</div>
               <div style="font-size:11px;color:#8b96a8">量能比 ${point.volume_ratio}</div>`;
           },
         },
@@ -111,7 +134,7 @@ export default {
             silent: true, symbol: "none",
             lineStyle: { color: "rgba(255,255,255,.18)", type: "dashed", width: 1 },
             label: { color: "#6c7789", fontSize: 9, position: "insideEndTop" },
-            data: [{ yAxis: 65, name: "偏热" }, { yAxis: 45, name: "中性" }, { yAxis: 30, name: "偏冷" }],
+            data: [{ yAxis: 65, name: "火热" }, { yAxis: 45, name: "中性" }, { yAxis: 30, name: "偏冷" }],
           },
           markPoint: {
             symbolSize: 6,
@@ -193,6 +216,7 @@ export default {
 
     return {
       state, go, dash, loading, indices, breadth, sentiment, outlook, sentimentOption, ai, ladder,
+      overview, refresh, distMax, distHeight, share, fmtYi,
       ladderStats, ladderLevels, maxBoard, stats, hotConcepts,
       sectorType, sectorSort, sectorItems, sectorLoading,
       switchType, switchSort, upRatio, openSector, openStock, visibleStocks, toggleLevel,
@@ -262,35 +286,85 @@ export default {
 
       <div v-if="!breadth" class="banner">该交易日为历史快照，仅展示指数与涨停数据，全市场涨跌家数需当日运行后记录。</div>
 
-      <section class="overview-grid" v-if="breadth">
-        <div class="card sentiment-card">
-          <div class="card-head">
-            <div>
-              <div class="card-title">市场情绪温度</div>
-              <div class="card-sub">综合涨跌家数、涨跌停、连板强度的量化评分</div>
+      <section class="card market-overview" v-if="breadth && overview">
+        <div class="card-head">
+          <div>
+            <div class="card-title">市场概况</div>
+            <div class="card-sub">涨跌分布 · 主力净流入 · 三市成交额（{{ overview.date }}）</div>
+          </div>
+          <div class="right" v-if="refresh">
+            <span class="tag">{{ refresh.label }}</span>
+            <span class="tag">下次刷新 <b class="num gold">{{ refresh.next_update }}</b></span>
+          </div>
+        </div>
+        <div class="mo-body">
+          <div class="mo-left">
+            <div class="mo-head">涨跌分布</div>
+            <div class="mo-sum num">
+              <span class="up">{{ overview.up }}</span>
+              <i>:</i>
+              <span class="flat">{{ overview.flat }}</span>
+              <i>:</i>
+              <span class="down">{{ overview.down }}</span>
             </div>
-            <div class="right" v-if="outlook">
-              <span class="verdict-badge" :class="outlook.tone">{{ outlook.pattern }}</span>
+            <div class="mo-split">
+              <i class="up" :style="{ width: share(overview.up) + '%' }"></i>
+              <i class="flat" :style="{ width: share(overview.flat) + '%' }"></i>
+              <i class="down" :style="{ width: share(overview.down) + '%' }"></i>
+            </div>
+            <div class="mo-hist">
+              <div class="mo-col" v-for="b in overview.distribution" :key="b.label"
+                   :class="{ peak: b.count >= distMax, zero: !b.count }"
+                   :title="b.label + '：' + b.count + ' 只 · ' + share(b.count) + '%'">
+                <span class="mo-count num">{{ b.count }}</span>
+                <div class="mo-track"><i :class="b.tone" :style="{ height: distHeight(b.count) }"></i></div>
+                <span class="mo-tick">{{ b.label }}</span>
+              </div>
             </div>
           </div>
-          <div class="sentiment-wrap">
-            <SentimentGauge :score="sentiment.score" :label="sentiment.label" />
-            <div class="sentiment-side">
-              <span class="sentiment-label" :class="sentiment.tone">当前状态：{{ sentiment.label }}</span>
-              <div class="sentiment-desc">
-                0-30 冰点 · 30-45 偏冷 · 45-65 中性 · 65-80 偏热 · 80+ 过热
-              </div>
-              <div class="comp-list">
-                <div class="comp" v-for="c in sentiment.components" :key="c.name">
-                  <span>{{ c.name }}</span>
-                  <span class="comp-bar"><i :style="{ width: c.value + '%' }"></i></span>
-                  <span class="val num">{{ c.value }}</span>
-                </div>
-              </div>
+          <div class="mo-right">
+            <div class="mo-row">
+              <span class="mo-k">主力净流入</span>
+              <span class="mo-v num" :class="tone(overview.main_flow)">
+                {{ overview.main_flow === null ? '数据源暂不可用' : signed(overview.main_flow) + ' 亿' }}
+              </span>
+            </div>
+            <div class="mo-row">
+              <span class="mo-k">市场情绪</span>
+              <span class="mo-v num gold">
+                {{ overview.sentiment.score }}<small> {{ overview.sentiment.label }}</small>
+              </span>
+            </div>
+            <div class="mo-row">
+              <span class="mo-k">昨日成交额</span>
+              <span class="mo-v num">{{ overview.amount ? fmtYi(overview.amount.prev) + ' 亿' : '-' }}</span>
+            </div>
+            <div class="mo-row">
+              <span class="mo-k">三市成交总额</span>
+              <span class="mo-v num">
+                {{ overview.amount ? fmtYi(overview.amount.total) + ' 亿' : '-' }}
+                <small v-if="overview.amount && overview.amount.delta !== null">
+                  较前一日同期{{ overview.amount.delta >= 0 ? '放量' : '缩量' }}
+                  <b :class="tone(overview.amount.delta)">{{ fmtYi(Math.abs(overview.amount.delta)) }}亿</b>
+                  <b :class="tone(overview.amount.delta_pct)">{{ signed(overview.amount.delta_pct) }}%</b>
+                </small>
+              </span>
+            </div>
+            <div class="mo-row">
+              <span class="mo-k">预测成交总额</span>
+              <span class="mo-v num">
+                {{ overview.amount ? fmtYi(overview.amount.forecast) + ' 亿' : '-' }}
+                <small v-if="overview.amount && overview.amount.avg60">
+                  近60日平均 {{ fmtYi(overview.amount.avg60) }}亿
+                  <b :class="tone(overview.amount.avg60_pct)">{{ signed(overview.amount.avg60_pct) }}%</b>
+                </small>
+              </span>
             </div>
           </div>
         </div>
+      </section>
 
+      <section v-if="breadth">
         <div class="card stat-card">
           <div class="card-head">
             <div>

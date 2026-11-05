@@ -1,9 +1,10 @@
 """研判引擎：情绪温度、指数技术面分析、AI 复盘文案"""
 import json
+import re
 import urllib.request
 
 from .config import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, LLM_TIMEOUT
-from .indicators import macd, kdj, rsi, ma, fib_levels, zigzag
+from .indicators import macd, kdj, rsi, ma, bollinger, fib_levels, zigzag
 from . import eastmoney as em
 
 NOISE_CONCEPTS = {
@@ -36,9 +37,9 @@ def compute_sentiment(breadth):
 
     score = round((s1 * 0.4 + s2 * 0.3 + s3 * 0.2 + s4 * 0.1) * 100, 1)
     if score >= 80:
-        label, tone = "过热", "hot"
+        label, tone = "沸点", "hot"
     elif score >= 65:
-        label, tone = "偏热", "warm"
+        label, tone = "火热", "warm"
     elif score >= 45:
         label, tone = "中性", "neutral"
     elif score >= 30:
@@ -666,54 +667,224 @@ def analyze_news(items):
     }
 
 
+# 产业链拆解：上游 -> 中游 -> 下游 + 核心传导逻辑与跟踪指标
+CHAIN_MAP = {
+    "半导体": {
+        "up": ("半导体设备", "光刻胶/电子特气", "大硅片"),
+        "mid": ("晶圆制造", "先进封装", "存储芯片"),
+        "down": ("消费电子", "汽车电子", "AI 服务器"),
+        "logic": "资本开支扩张时，设备与材料最先拿到订单；随后传导到晶圆厂产能利用率与代工报价；最终由终端需求（手机 / 汽车 / AI）决定景气高度与持续性。",
+        "watch": "晶圆厂招标与中标公告、设备验证与验收进度、月度产能利用率与代工价格",
+    },
+    "AI 与算力": {
+        "up": ("光芯片", "PCB / 铜箔", "电源与散热"),
+        "mid": ("光模块", "AI 服务器", "交换机"),
+        "down": ("云厂商资本开支", "IDC 与液冷", "AI 应用"),
+        "logic": "云厂商资本开支决定算力订单总量，光模块与服务器最先反映在手订单，再向上游光芯片、PCB 传导，最后落到应用端变现。",
+        "watch": "北美云厂商资本开支指引、800G / 1.6T 出货节奏、光模块月度出口数据",
+    },
+    "新能源": {
+        "up": ("锂矿 / 镍钴", "正负极材料", "隔膜电解液"),
+        "mid": ("电芯制造", "逆变器", "储能系统"),
+        "down": ("整车", "储能电站", "电网消纳"),
+        "logic": "原材料价格决定中游成本，电芯排产与产能利用率决定盈利弹性，终端装机与海外订单决定需求天花板。",
+        "watch": "碳酸锂价格、月度装机与排产数据、海外大储订单与并网进度",
+    },
+    "医药": {
+        "up": ("原料药", "CXO", "设备耗材"),
+        "mid": ("创新药", "疫苗", "仿制药"),
+        "down": ("医院终端", "医保支付", "出海渠道"),
+        "logic": "研发与审批端决定管线价值，医保与集采决定价格与放量节奏，出海授权提供第二增长曲线。",
+        "watch": "临床试验与审批节点、集采与医保谈判结果、海外授权首付款公告",
+    },
+    "地产链": {
+        "up": ("土地成交", "水泥建材", "玻璃"),
+        "mid": ("房企开发", "施工建设", "竣工交付"),
+        "down": ("家居", "家电", "物业管理"),
+        "logic": "政策先改善销售与融资预期，房企拿地与开工决定中游需求，竣工交付后才会传导到家居与家电。",
+        "watch": "30 城商品房成交面积、房企融资与拿地数据、竣工面积与交付节奏",
+    },
+    "券商金融": {
+        "up": ("交易通道", "两融业务", "资管产品"),
+        "mid": ("券商", "银行", "保险"),
+        "down": ("实体融资", "居民理财", "市场成交额"),
+        "logic": "成交额与两融余额直接决定券商业绩弹性，利率与信贷决定银行息差，风险偏好决定保险与资管的产品销售。",
+        "watch": "两市日成交额、两融余额、信贷与社融数据、政策对资本市场表述",
+    },
+    "消费": {
+        "up": ("农产品", "包装材料", "物流仓储"),
+        "mid": ("白酒", "食品饮料", "免税"),
+        "down": ("渠道零售", "餐饮旅游", "出行"),
+        "logic": "居民收入与消费信心决定需求，渠道库存与批价反映真实动销，成本端变化影响毛利与提价空间。",
+        "watch": "高端白酒批价与动销、社零与CPI 食品分项、节假日出行与免税销售",
+    },
+    "军工": {
+        "up": ("特种材料", "军用元器件", "芯片"),
+        "mid": ("分系统", "发动机", "雷达"),
+        "down": ("整机总装", "维修保障", "出口"),
+        "logic": "订单与预付款决定排产，上游材料与元器件最先反映放量，整机交付节奏决定收入确认。",
+        "watch": "年度订单与预付款公告、批产型号交付节奏、军工集团资本开支",
+    },
+    "资源品": {
+        "up": ("矿产开采", "冶炼", "采选设备"),
+        "mid": ("加工材", "化工品", "合金"),
+        "down": ("制造业", "电力", "建筑基建"),
+        "logic": "商品价格直接决定上游利润，加工费与库存决定中游盈利，下游需求强弱决定价格能否持续。",
+        "watch": "商品期货价格与库存、加工费（TC/RC）、下游开工率与进口数据",
+    },
+}
+
+# 无明确行业映射时，用宏观传导链兜底
+MACRO_CHAIN = {
+    "up": ("政策 / 事件本身", "流动性预期", "风险偏好"),
+    "mid": ("权重蓝筹", "成长赛道", "主题概念"),
+    "down": ("板块轮动", "个股弹性", "资金承接"),
+    "logic": "宏观与政策类消息先改变风险偏好与流动性预期，再经由权重与成长风格传导到具体板块，最后体现为个股弹性与资金承接力度。",
+    "watch": "政策细则与落地节奏、北向与两融资金变化、指数成交额能否同步放大",
+}
+
+TAG_ANALOGY = {
+    "货币政策": "历史上货币宽松落地后，券商、地产与高股息往往在落地后 5 个交易日内相对占优；但若信贷与地产销售未同步改善，行情多在 2-3 周内回归基本面。",
+    "海外流动性": "海外利率回落阶段，A股成长风格（半导体、算力）弹性通常强于价值；若美元重新走强，外资偏好的核心资产会先承压。",
+    "政策": "产业政策从发布到订单落地通常需要 1-2 个季度，行情节奏多为“发布日脉冲—细则期发酵—业绩期分化”。",
+    "财政": "财政发力对基建、设备更新与消费的传导存在时滞，市场通常先交易预期，再等待资金到位与项目开工数据验证。",
+    "宏观数据": "宏观数据超预期时，顺周期与金融先反应；不及预期时，资金往往回流防御性板块与高股息。",
+    "中美关系": "外部扰动多带来 1-3 个交易日的风险偏好冲击，出口链与科技链波动放大，但很少单独改变中期趋势。",
+    "资金面": "增量资金入场往往先抬升指数与权重，再扩散到题材；ETF 与两融的方向性变化比单日数据更有参考意义。",
+    "大宗商品": "商品价格上行初期利好资源品，中后期转为中游成本压力；价格见顶回落时，中游制造的毛利修复弹性更大。",
+    "地缘政治": "地缘冲突升温时，黄金、原油与军工短线占优，风险资产整体承压，持续性取决于冲突是否外溢到供应链。",
+    "海外经济": "海外衰退预期升温阶段，出口链承压而内需与政策受益方向相对占优，需同步跟踪美联储表态。",
+}
+
+
+def _news_facts(text, limit=4):
+    """从正文中拆出关键事实句，作为分析的事实基础"""
+    parts = re.split(r"[。；!?！？\n]", text or "")
+    facts = []
+    for part in parts:
+        piece = part.strip(" ，,、")
+        if len(piece) >= 10 and piece not in facts:
+            facts.append(piece)
+    return facts[:limit]
+
+
+def _chain_for(sectors):
+    for name in sectors or []:
+        data = CHAIN_MAP.get(name)
+        if data:
+            return name, data
+    return "", MACRO_CHAIN
+
+
 def news_item_analysis(item):
-    """单条新闻的 AI 深度解读：影响路径、受益/受损方向、持续性与应对"""
+    """单条新闻的 AI 深度解读：产业传导链、受益结构、节奏与跟踪点"""
     item = item or {}
-    title = item.get("title") or ""
-    summary = item.get("summary") or ""
+    title = (item.get("title") or "").strip()
+    summary = (item.get("summary") or "").strip()
     text = f"{title} {summary}"
     impact = item.get("impact") or "中性"
     tags = item.get("tags") or []
+    level = int(item.get("level") or 1)
+    upcoming = bool(item.get("upcoming"))
+    scope = item.get("scope") or "国内"
 
-    sectors = []
+    # 按关键词命中次数排序，避免“算力”类新闻被半导体优先抢占
+    scored = []
     for name, words in INDUSTRY_HINTS.items():
-        if any(w in text for w in words):
-            sectors.append(name)
+        hits = sum(text.count(w) for w in words)
+        if hits:
+            scored.append((hits, name))
+    scored.sort(key=lambda row: -row[0])
+    sectors = [name for _, name in scored]
 
-    core = summary.strip()[:160] if summary.strip() else title
-    if len(core) < len(title) * 0.7:
-        core = title
+    core = summary if summary and len(summary) >= len(title) * 0.7 else title
+    core = core.rstrip("。；;，,、 ")[:200]
+
+    chain_name, chain = _chain_for(sectors)
+    facts = _news_facts(summary or title)
+
+    intensity = min(100, 40 + level * 10 + (12 if impact != "中性" else 0))
+    persistence = min(100, 30 + level * 12 + (8 if upcoming else 0))
+    certainty = min(100, 35 + level * 10 + (10 if scope == "国内" else 0))
 
     if impact == "利好":
-        path = "消息面偏正面，风险偏好提升，资金更愿意流向弹性品种，短期有利于相关板块估值修复。"
-        play = "关注直接受益方向的龙头与低位补涨，回踩确认后再介入，避免开盘一字追高。"
         tone = "bull"
+        path = "消息面偏正面，风险偏好抬升，资金更愿意流向弹性品种，短期有利于相关板块的估值修复与订单预期上修。"
+        play = "优先看直接受益环节的龙头，等回踩确认后再介入；开盘一字不宜追高，仓位与止损同步设定。"
+        benefit = (f"直接受益：{chain['up'][0]}、{chain['mid'][0]}；"
+                   f"间接受益：{chain['down'][0]} 等下游应用与配套环节。")
+        risks = [
+            "预期差风险：市场往往提前交易预期，落地力度若不及预期，容易出现冲高回落。",
+            "拥挤度风险：板块短期涨幅过大、成交额占比过高时，获利了结压力会显著放大波动。",
+            "兑现时滞：从政策 / 事件到订单、再到报表利润通常滞后 1-2 个季度，业绩验证前不宜给过高估值。",
+        ]
     elif impact == "利空":
-        path = "消息面偏负面，压制风险偏好，资金倾向于防守，高估值与高位品种承压更明显。"
-        play = "控制仓位，优先回避直接受损方向，等待情绪宣泄后观察缩量止跌信号。"
         tone = "bear"
+        path = "消息面偏负面，压制风险偏好，资金倾向防守，高估值与高位品种的承压幅度通常大于低估值品种。"
+        play = "先控制仓位，回避直接受损方向；等待情绪宣泄后观察缩量止跌与龙头是否率先修复。"
+        benefit = (f"直接承压：{chain['up'][0]}、{chain['mid'][0]}；"
+                   f"情绪外溢：{chain['down'][0]} 等下游需求预期同步走弱。")
+        risks = [
+            "情绪扩散：若相关板块权重较高，可能拖累指数并引发被动减仓。",
+            "二次冲击：后续数据或政策若继续恶化，压制时间会明显拉长。",
+            "流动性负反馈：下跌中若伴随放量，需警惕融资盘被动平仓带来的加速下行。",
+        ]
     else:
-        path = "消息对指数影响有限，更多体现为结构性催化，需结合板块资金流与量能确认。"
-        play = "以观察为主，跟踪板块内龙头是否放量走强，再决定是否参与。"
         tone = "neutral"
+        path = "消息对指数影响有限，更多体现为结构性催化，需要结合板块资金流与量能确认方向。"
+        play = "以观察为主，跟踪板块内龙头是否放量走强，出现合力后再决定是否参与。"
+        benefit = (f"结构性影响：{chain['up'][0]} 与 {chain['mid'][0]} 更早反映预期，"
+                   f"{chain['down'][0]} 需要实际需求验证才具备持续性。")
+        risks = [
+            "方向不明：中性消息若得不到资金认可，可能只形成一日游行情。",
+            "结构分化：同一消息对不同环节影响不同，需区分直接受益与纯情绪炒作。",
+            "信息衰减：快讯类消息生命周期短，需等待后续权威口径与数据确认。",
+        ]
 
-    level = item.get("level") or 1
     if level >= 4:
-        duration = "影响级别较高，通常可延续 3-10 个交易日，需持续跟踪后续落地进展。"
+        duration = "影响级别较高，通常可延续 3-10 个交易日，需持续跟踪后续落地进展与细则。"
     elif level == 3:
-        duration = "影响偏中期，短期以情绪脉冲为主，重点看板块内龙头是否持续走强。"
+        duration = "影响偏中期，短期以情绪脉冲为主，重点看板块内龙头能否持续走强。"
     else:
         duration = "影响偏短期，多为日内情绪扰动，不宜据此单独做交易决策。"
 
-    if item.get("upcoming"):
+    if upcoming:
         path = "属于尚未落地的前瞻事件，市场会提前交易预期，" + path
         duration = "事件落地前预期博弈主导，落地后需防范“利好兑现”式回落。"
+        risks.append("预期兑现风险：事件真正落地时容易“利好出尽”，需提前设定退出条件。")
+
+    if impact == "利空":
+        impact_path = [
+            {"stage": "事件", "text": core[:80]},
+            {"stage": "预期", "text": f"风险偏好下降，{chain['up'][0]} 与 {chain['mid'][0]} 的估值先被压缩"},
+            {"stage": "基本面", "text": "若影响持续，订单与排产预期下调，滞后 1-2 个季度体现在报表"},
+            {"stage": "股价", "text": "短期急跌后往往有反抽，反弹高度取决于消息是否被证伪"},
+        ]
+    else:
+        impact_path = [
+            {"stage": "事件", "text": core[:80]},
+            {"stage": "预期", "text": f"资金先交易预期，{chain['up'][0]} 与 {chain['mid'][0]} 的弹性最大"},
+            {"stage": "基本面", "text": "订单与排产逐步验证，1-2 个季度后体现在收入与毛利"},
+            {"stage": "股价", "text": "先急涨后分化，能兑现业绩的龙头走趋势，纯概念品种大概率回落"},
+        ]
+
+    watch = [chain["watch"],
+             "跟踪板块成交额与龙头是否持续放量，确认资金是否形成合力",
+             "跟踪同类消息的出现密度，单条快讯难以构成中期主线"]
+    if upcoming:
+        watch.insert(0, "锁定事件落地时间点，提前一周观察资金是否提前抢跑")
 
     sector_text = "、".join(sectors[:3]) if sectors else "无明确直接映射，更多是宏观层面的间接影响"
-    drivers = [f"核心信息：{core[:90]}", f"影响路径：{path}", f"关联方向：{sector_text}",
-               f"周期判断：{duration}", f"应对思路：{play}"]
+    drivers = [
+        f"核心事实：{facts[0] if facts else core[:90]}",
+        f"产业归属：{chain_name + '链' if chain_name else '宏观 / 主题层面'}（{sector_text}）",
+        f"产业逻辑：{chain['logic']}",
+        f"受益结构：{benefit}",
+        f"周期判断：{duration}",
+        f"应对思路：{play}",
+    ]
     if tags:
-        drivers.insert(0, "消息分类：" + "、".join(tags[:3]) + f"（{item.get('scope') or '国内'}）")
+        drivers.insert(0, "消息分类：" + "、".join(tags[:3]) + f"（{scope}）")
 
     plays = {"leaders": [], "small_caps": [], "note": ""}
     try:
@@ -727,15 +898,41 @@ def news_item_analysis(item):
     if plays.get("note") and (plays.get("leaders") or plays.get("small_caps")):
         drivers.append(plays["note"])
 
+    primary_tag = tags[0] if tags else ""
+    summary_text = (
+        f"事件要点：{core[:130]}。"
+        f"属性判断：{scope}{'前瞻' if upcoming else '已发生'}的"
+        f"{impact if impact != '中性' else '中性信息'}，影响级别 L{level}；"
+        f"强度 {intensity}／持续性 {persistence}／确定性 {certainty}（满分 100）。"
+        f"主线性：{TAG_COMMENT.get(primary_tag, '关注消息对相关板块的传导力度')}。"
+    )
+
     return {
         "title": title,
         "impact": impact,
         "tone": tone,
-        "scope": item.get("scope"),
+        "scope": scope,
         "level": level,
-        "upcoming": bool(item.get("upcoming")),
-        "sectors": sectors[:3],
-        "summary": core,
+        "upcoming": upcoming,
+        "sectors": sectors[:5],
+        "chain_name": chain_name,
+        "summary": summary_text,
+        "core": core,
+        "facts": facts,
+        "impact_path": impact_path,
+        "chain": {
+            "name": chain_name or "宏观 / 主题",
+            "up": list(chain["up"]),
+            "mid": list(chain["mid"]),
+            "down": list(chain["down"]),
+            "logic": chain["logic"],
+            "watch": chain["watch"],
+        },
+        "benefit": benefit,
+        "risks": risks,
+        "watch": watch,
+        "score": {"intensity": intensity, "persistence": persistence, "certainty": certainty},
+        "analogy": TAG_ANALOGY.get(primary_tag, "暂无高度相似的历史样本，建议以板块资金流与龙头走势作为主要验证信号。"),
         "path": path,
         "duration": duration,
         "playbook": play,
@@ -748,9 +945,79 @@ def news_item_analysis(item):
     }
 
 
-# ---------------------------------------------------------------- 个股六指标研判
+# ---------------------------------------------------------------- 个股八指标研判
+def _candle_pattern(bars):
+    """蜡烛图形态识别：用最近 2-3 根日K给出形态结论（+1 看涨 / 0 中性 / -1 看跌）"""
+    if len(bars) < 3:
+        return {"name": "数据不足", "vote": 0, "desc": "K线不足 3 根，无法判断形态", "detail": "-"}
+    last, prev, prev2 = bars[-1], bars[-2], bars[-3]
+
+    def _body(b):
+        return (b.get("close") or 0) - (b.get("open") or 0)
+
+    def _span(b):
+        return max((b.get("high") or b["close"]) - (b.get("low") or b["open"]), 0.001)
+
+    def _ratio(b):
+        return abs(_body(b)) / _span(b)
+
+    def _shadows(b):
+        top = (b.get("high") or b["close"]) - max(b.get("open"), b["close"])
+        bottom = min(b.get("open"), b["close"]) - (b.get("low") or b["close"])
+        return top, bottom
+
+    lb, pb, ppb = _body(last), _body(prev), _body(prev2)
+    top, bottom = _shadows(last)
+    detail = (f"实体 {abs(lb) / _span(last) * 100:.0f}% / "
+              f"上影 {top / _span(last) * 100:.0f}% / 下影 {bottom / _span(last) * 100:.0f}%")
+
+    # 1. 三根K线组合：启明星 / 黄昏星
+    mid_prev2 = (prev2["open"] + prev2["close"]) / 2
+    if ppb < 0 and _ratio(prev) <= 0.35 and lb > 0 and last["close"] > mid_prev2 and abs(ppb) >= _span(prev2) * 0.5:
+        return {"name": "启明星", "vote": 1,
+                "desc": "下跌后小实体止跌、阳线收复前一根阴线一半，底部反转信号", "detail": detail}
+    if ppb > 0 and _ratio(prev) <= 0.35 and lb < 0 and last["close"] < mid_prev2 and abs(ppb) >= _span(prev2) * 0.5:
+        return {"name": "黄昏星", "vote": -1,
+                "desc": "上涨后小实体滞涨、阴线吃掉前一根阳线一半，顶部反转信号", "detail": detail}
+
+    # 2. 两根K线组合：吞没
+    if pb < 0 and lb > 0 and last["close"] >= prev["open"] and last["open"] <= prev["close"]:
+        return {"name": "看涨吞没", "vote": 1,
+                "desc": "阳线实体完全覆盖前一根阴线，空头被打断", "detail": detail}
+    if pb > 0 and lb < 0 and last["close"] <= prev["open"] and last["open"] >= prev["close"]:
+        return {"name": "看跌吞没", "vote": -1,
+                "desc": "阴线实体完全覆盖前一根阳线，多头被打断", "detail": detail}
+
+    # 3. 连续三根同向
+    three = bars[-3:]
+    if all(_body(b) > 0 for b in three) and all(three[i]["close"] > three[i - 1]["close"] for i in (1, 2)):
+        return {"name": "红三兵", "vote": 1, "desc": "连续三根阳线且收盘抬高，多头持续占优",
+                "detail": detail}
+    if all(_body(b) < 0 for b in three) and all(three[i]["close"] < three[i - 1]["close"] for i in (1, 2)):
+        return {"name": "三只乌鸦", "vote": -1, "desc": "连续三根阴线且收盘走低，空头持续占优",
+                "detail": detail}
+
+    # 4. 单根长影线：锤子线 / 流星线
+    if lb != 0 and bottom >= abs(lb) * 2 and top <= abs(lb) * 0.6 and _ratio(last) <= 0.55:
+        return {"name": "锤子线", "vote": 1, "desc": "长下影显示低位有承接，止跌信号", "detail": detail}
+    if lb != 0 and top >= abs(lb) * 2 and bottom <= abs(lb) * 0.6 and _ratio(last) <= 0.55:
+        return {"name": "流星线", "vote": -1, "desc": "长上影显示冲高遇阻，回落风险上升", "detail": detail}
+
+    # 5. 十字星 / 大实体
+    if _ratio(last) <= 0.12:
+        return {"name": "十字星", "vote": 0, "desc": "多空平衡的变盘信号，等下一根K线确认", "detail": detail}
+    body_pct = lb / last["close"] * 100 if last["close"] else 0
+    if body_pct >= 4:
+        return {"name": "大阳线", "vote": 1, "desc": "单根放量长阳，日内多头强势", "detail": detail}
+    if body_pct <= -4:
+        return {"name": "大阴线", "vote": -1, "desc": "单根长阴，日内空头强势", "detail": detail}
+
+    return {"name": "无明确形态", "vote": 0, "desc": "最近一根为普通K线，多空未形成明确形态",
+            "detail": detail}
+
+
 def analyze_stock_indicators(name, bars):
-    """六个指标（均线、MACD、KDJ、RSI、量能、支撑压力）综合给出次日判断"""
+    """八个指标（均线、MACD、KDJ、RSI、布林带、K线形态、量能、支撑压力）综合给出次日判断"""
     if not bars or len(bars) < 30:
         raise ValueError("K线数据不足")
     closes = [b["close"] for b in bars]
@@ -769,6 +1036,10 @@ def analyze_stock_indicators(name, bars):
     rv = r[last]
     macd_cross = _cross_index(m["dif"], m["dea"])
     kdj_cross = _cross_index(k["k"], k["d"])
+    boll = bollinger(closes, 20, 2.0)
+    b_last = boll[-1] or {}
+    b_prev = boll[-2] or {}
+    candle = _candle_pattern(bars)
 
     recent = bars[-120:] if len(bars) >= 120 else bars
     swing_high = max(b["high"] for b in recent)
@@ -794,6 +1065,9 @@ def analyze_stock_indicators(name, bars):
     else:
         add("ma", "均线系统", 0, f"MA5 {ma5[last]:.2f} / MA20 {ma20[last]:.2f}",
             "均线缠绕，方向待选择")
+
+    add("candle", "K线形态", candle["vote"], candle["name"],
+        f"{candle['desc']}（{candle['detail']}）")
 
     if macd_cross == 1 or (hist > 0 and dif > dea):
         add("macd", "MACD", 1, f"DIF {dif:.2f} / DEA {dea:.2f} / 柱 {hist:.2f}",
@@ -822,6 +1096,25 @@ def analyze_stock_indicators(name, bars):
     else:
         add("rsi", "RSI", 0, f"RSI {rv:.1f}" if rv is not None else "RSI -", "进入超买区，注意高位钝化")
 
+    upper, lower, mid = b_last.get("upper"), b_last.get("lower"), b_last.get("mid")
+    mid_prior = b_prev.get("mid")
+    width = b_last.get("width")
+    if upper and price > upper:
+        add("boll", "布林带", -1, f"上轨 {upper:.2f} / 中轨 {mid:.2f}",
+            "价格运行在上轨之外，短线过热，均值回归压力大")
+    elif lower and price < lower:
+        add("boll", "布林带", -1, f"下轨 {lower:.2f} / 中轨 {mid:.2f}",
+            "跌破下轨且未见止跌，弱势延续")
+    elif mid and mid_prior and price >= mid and mid > mid_prior:
+        add("boll", "布林带", 1, f"中轨 {mid:.2f} / 带宽 {width}%",
+            "站上中轨且中轨向上，强势区间运行")
+    elif mid and mid_prior and price < mid and mid < mid_prior:
+        add("boll", "布林带", -1, f"中轨 {mid:.2f} / 带宽 {width}%",
+            "中轨下方且中轨下压，弱势格局")
+    else:
+        add("boll", "布林带", 0, f"中轨 {mid if mid else '-'} / 带宽 {width if width else '-'}%",
+            "价格在中轨附近震荡，等带宽收窄后的方向选择")
+
     vol_ma5 = sum(volumes[-5:]) / 5 if volumes else 0
     today_vol = volumes[-1] if volumes else 0
     if today_vol and vol_ma5:
@@ -846,9 +1139,9 @@ def analyze_stock_indicators(name, bars):
             "跌破关键回撤位，下方支撑需重新确认")
 
     score = sum(v["vote"] for v in votes)
-    if score >= 2:
+    if score >= 3:
         direction, tone = "偏多", "bull"
-    elif score <= -2:
+    elif score <= -3:
         direction, tone = "偏空", "bear"
     else:
         direction, tone = "震荡", "neutral"
@@ -856,11 +1149,11 @@ def analyze_stock_indicators(name, bars):
     bull_count = sum(1 for v in votes if v["vote"] > 0)
     bear_count = sum(1 for v in votes if v["vote"] < 0)
     expect = {
-        "bull": f"六个指标中 {bull_count} 项偏多、{bear_count} 项偏空，次日大概率延续偏强走势，"
+        "bull": f"八个指标中 {bull_count} 项偏多、{bear_count} 项偏空，次日大概率延续偏强走势，"
                 f"上方关注 {resistance:.2f} 压力，站稳后有望打开空间。",
-        "bear": f"六个指标中 {bear_count} 项偏空、{bull_count} 项偏多，次日偏向弱势震荡，"
+        "bear": f"八个指标中 {bear_count} 项偏空、{bull_count} 项偏多，次日偏向弱势震荡，"
                 f"下方关注 {support:.2f} 支撑，失守则需减仓。",
-        "neutral": f"六个指标多空分歧（{bull_count} 多 / {bear_count} 空），次日大概率维持震荡，"
+        "neutral": f"八个指标多空分歧（{bull_count} 多 / {bear_count} 空），次日大概率维持震荡，"
                    f"区间参考 {support:.2f} ~ {resistance:.2f}。",
     }[tone]
     action = {
@@ -877,7 +1170,7 @@ def analyze_stock_indicators(name, bars):
     if hist < 0 and dif < dea:
         risks.append("MACD 绿柱未收敛，动能仍在走弱")
     if not risks:
-        risks.append("若放量跌破支撑位，六指标共振转空，需及时止损")
+        risks.append("若放量跌破支撑位，八指标共振转空，需及时止损")
 
     return {
         "name": name,
@@ -892,6 +1185,309 @@ def analyze_stock_indicators(name, bars):
         "tomorrow": {"bias": direction, "expectation": expect, "action": action,
                      "bull_count": bull_count, "bear_count": bear_count},
         "risks": risks,
+    }
+
+
+# ---------------------------------------------------------------- 明日预期与应对策略
+def build_stock_strategy(bars, indicator, valuation=None):
+    """把八指标结论与价值分析合成「明日预期 + 短期/中期应对策略」"""
+    if not indicator or not bars:
+        return None
+    closes = [b["close"] for b in bars]
+    highs = [b["high"] for b in bars]
+    lows = [b["low"] for b in bars]
+    price = indicator.get("price") or (closes[-1] if closes else 0)
+    if not price:
+        return None
+    levels = indicator.get("levels") or {}
+    support = levels.get("support") or price
+    resistance = levels.get("resistance") or price
+    swing_low = levels.get("swing_low") or support
+    bob = indicator.get("tomorrow") or {}
+    tone = indicator.get("tone") or "neutral"
+    direction = indicator.get("direction") or "震荡"
+    score = indicator.get("score") or 0
+    bull_count = bob.get("bull_count") or 0
+    bear_count = bob.get("bear_count") or 0
+
+    # 明日波动区间：以近 20 日平均振幅为半径，再叠加支撑压力参考
+    changes = [abs(b.get("change_pct") or 0) for b in bars[-20:] if b.get("change_pct") is not None]
+    amplitude = round(sum(changes) / len(changes), 2) if changes else 2.0
+    amplitude = max(1.0, min(amplitude, 9.0))
+    exp_low = round(price * (1 - amplitude / 100), 2)
+    exp_high = round(price * (1 + amplitude / 100), 2)
+
+    # 明日可执行的参考位：优先用最近均线，离现价过远则退回次日振幅上/下沿
+    ma5 = ma(closes, 5)[-1] if len(closes) >= 5 else None
+    ma10 = ma(closes, 10)[-1] if len(closes) >= 10 else None
+    ma20 = ma(closes, 20)[-1] if len(closes) >= 20 else None
+    ma60 = ma(closes, 60)[-1] if len(closes) >= 60 else None
+    above = [(n, v) for n, v in (("MA5", ma5), ("MA10", ma10), ("MA20", ma20)) if v and v > price]
+    below = [(n, v) for n, v in (("MA5", ma5), ("MA10", ma10), ("MA20", ma20)) if v and v < price]
+    if above:
+        res_name, near_res = min(above, key=lambda x: x[1])
+        res_source = f"现价上方最近的 {res_name} {near_res:.2f}"
+    else:
+        near_res = resistance
+        res_source = f"无均线压制，取斐波那契结构压力 {resistance:.2f}"
+    if below:
+        sup_name, near_sup = max(below, key=lambda x: x[1])
+        sup_source = f"现价下方最近的 {sup_name} {near_sup:.2f}"
+    else:
+        near_sup = support
+        sup_source = f"无均线支撑，取斐波那契结构支撑 {support:.2f}"
+    if abs((near_res - price) / price * 100) > amplitude * 2:
+        near_res = exp_high
+        res_source = f"结构位距现价超过 2 倍日均振幅（{amplitude}%），改用区间上沿"
+    if abs((price - near_sup) / price * 100) > amplitude * 2:
+        near_sup = exp_low
+        sup_source = f"结构位距现价超过 2 倍日均振幅（{amplitude}%），改用区间下沿"
+    pct_near_sup = (near_sup - price) / price * 100
+    pct_near_res = (near_res - price) / price * 100
+
+    if abs(score) >= 5:
+        confidence = "高"
+    elif abs(score) >= 4:
+        confidence = "中高"
+    elif abs(score) >= 3:
+        confidence = "中"
+    else:
+        confidence = "低"
+
+    if tone == "bull":
+        p_up = 60 if score >= 5 else 52
+        rest = 100 - p_up
+        p_chase = int(rest * 0.6)
+        scenarios = [
+            {"name": "延续上攻", "prob": p_up,
+             "trigger": f"开盘 30 分钟站稳 {near_sup:.2f} 且量比大于 1",
+             "plan": f"持股待涨，放量突破 {near_res:.2f} 后加仓，日内目标看 {exp_high:.2f}"},
+            {"name": "冲高回落", "prob": p_chase,
+             "trigger": f"早盘冲高 {near_res:.2f}（{pct_near_res:+.2f}%）附近滞涨、量能萎缩",
+             "plan": "冲高不追，原仓位在压力位附近减 1/3，回落不破支撑再接回"},
+            {"name": "放量破位", "prob": rest - p_chase,
+             "trigger": f"放量跌破 {near_sup:.2f}（{pct_near_sup:+.2f}%）",
+             "plan": "跌破立即减仓至 3 成以下，等重新站回支撑再评估"},
+        ]
+    elif tone == "bear":
+        p_down = 60 if score <= -5 else 52
+        scenarios = [
+            {"name": "弱势下探", "prob": p_down,
+             "trigger": f"反抽不过 {near_res:.2f}（{pct_near_res:+.2f}%）且量能萎缩",
+             "plan": f"反弹至压力位附近以减仓为主，日内下探目标看 {exp_low:.2f}"},
+            {"name": "低位止跌", "prob": 30,
+             "trigger": f"{near_sup:.2f}（{pct_near_sup:+.2f}%）附近缩量收长下影",
+             "plan": "只做超跌反弹，轻仓快进快出，不追高、不留隔夜重仓"},
+            {"name": "加速下跌", "prob": 100 - p_down - 30,
+             "trigger": f"放量击穿 {near_sup:.2f}，板块同步走弱",
+             "plan": "立即降仓或清仓，等日线出现止跌信号再考虑接回"},
+        ]
+    else:
+        scenarios = [
+            {"name": "区间震荡", "prob": 50,
+             "trigger": f"价格在 {near_sup:.2f} ~ {near_res:.2f} 内反复",
+             "plan": "区间下沿低吸、上沿减仓，以做 T 为主，不提前埋伏突破"},
+            {"name": "向上突破", "prob": 25,
+             "trigger": f"放量站上 {near_res:.2f}（{pct_near_res:+.2f}%）且次日不回破",
+             "plan": "突破确认后再加仓，避免日内假突破追高"},
+            {"name": "向下跌破", "prob": 25,
+             "trigger": f"收盘失守 {near_sup:.2f}（{pct_near_sup:+.2f}%）",
+             "plan": "跌破减仓至 2-3 成，等重新企稳再回补"},
+        ]
+
+    watch = [
+        f"{near_sup:.2f} 支撑 / {near_res:.2f} 压力是否得失",
+        "开盘 30 分钟量能与昨日对比，放量方向决定强弱",
+        "分时均价线上方运行、回踩是否有承接",
+    ]
+    if tone == "bull" and (score >= 5):
+        watch.append("连阳后是否出现高位放量滞涨（冲高回落信号）")
+    if tone == "bear":
+        watch.append("反抽能否放量收复 5 日线，否则反弹视为逃命波")
+
+    expect = {
+        "bull": f"{bull_count} 项指标偏多、{bear_count} 项偏空，明日偏向强势运行，预期区间 "
+                f"{exp_low:.2f} ~ {exp_high:.2f}；站稳 {near_res:.2f} 有望打开空间，跌破 {near_sup:.2f} 则结构转弱。",
+        "bear": f"{bear_count} 项指标偏空、{bull_count} 项偏多，明日偏弱震荡概率较高，预期区间 "
+                f"{exp_low:.2f} ~ {exp_high:.2f}；收复 {near_res:.2f} 才算转强，失守 {near_sup:.2f} 需减仓。",
+        "neutral": f"多空分歧（{bull_count} 多 / {bear_count} 空），明日大概率区间震荡，参考 "
+                   f"{near_sup:.2f} ~ {near_res:.2f}，放量选择方向后再跟随。",
+    }[tone]
+
+    # 短线：1-5 个交易日，以技术面为主
+    # 短线过热：J 值破百、K 值高位或 RSI 进入超买区
+    k_lines = kdj(highs, lows, closes)
+    r_line = rsi(closes)
+    jv, kv, rv = k_lines["j"][-1], k_lines["k"][-1], r_line[-1]
+    overheated = bool(jv > 100 or kv > 90 or (rv is not None and rv > 75))
+    if tone == "bull" and overheated:
+        short_stance = "持有不追高"
+        short_actions = [
+            f"已有仓位继续持有，冲高至 {near_res:.2f} 附近先减 1/3 兑现",
+            f"回踩 {near_sup:.2f} 不破可低吸，仓位维持 4-5 成",
+            f"收盘跌破 {near_sup:.2f} 减仓，不扛单",
+        ]
+    elif tone == "bull":
+        short_stance = "顺势做多"
+        short_actions = [
+            f"回踩 {near_sup:.2f} 附近低吸，仓位 5-6 成",
+            f"放量突破 {near_res:.2f} 后加仓，短线目标 {exp_high:.2f}",
+            f"跌破 {near_sup:.2f} 或 MA5 走平均减仓",
+        ]
+    elif tone == "bear":
+        short_stance = "降仓防守"
+        short_actions = [
+            f"反弹至 {near_res:.2f} 附近减仓，不接下跌中的刀",
+            "仓位降至 2-3 成或空仓，等日线止跌信号",
+            f"跌破 {near_sup:.2f} 清仓离场",
+        ]
+    else:
+        short_stance = "半仓区间操作"
+        short_actions = [
+            f"{near_sup:.2f} 附近低吸、{near_res:.2f} 附近减仓，做区间波段",
+            "仓位 3-4 成，不在突破前重仓埋伏",
+            f"任一方向放量突破（{near_res:.2f} / {near_sup:.2f}）再顺势加仓",
+        ]
+    short_guard = f"短线失效条件：收盘跌破 {near_sup:.2f}（{pct_near_sup:+.2f}%）或连续两日缩量阴跌"
+
+    # 中线：1-3 个月，以价值与趋势为主
+    val_score = (valuation or {}).get("score")
+    latest = (valuation or {}).get("latest") or {}
+    research = (valuation or {}).get("research") or {}
+    uptrend = bool(ma20 and ma60 and price > ma20 > ma60)
+    if val_score is None:
+        mid_stance = "以短线为主"
+    elif val_score >= 75:
+        mid_stance = "逢低配置" if uptrend else "价值优先，等趋势确认"
+    elif val_score >= 60:
+        mid_stance = "回调分批建仓" if uptrend else "基本面良好，等右侧确认"
+    elif val_score >= 45:
+        mid_stance = "观察等待"
+    else:
+        mid_stance = "不宜中线重仓"
+
+    mid_actions = []
+    if uptrend:
+        mid_actions.append(f"趋势向上（价格站上 MA20 {ma20:.2f}、MA60 {ma60:.2f}），回踩 MA20 附近可分批建仓")
+    else:
+        mid_actions.append(f"趋势未确认，等站稳 MA20 {ma20:.2f} 与 MA60 {ma60:.2f} 后再介入" if ma20 and ma60 else "均线数据不足，先观察 60 日均线是否走平")
+    if val_score is not None:
+        mid_actions.append(f"价值四维评分 {val_score} 分，"
+                           + ("基本面良好，可按 3 成分批布局" if val_score >= 60
+                              else "基本面中性，中线仓位不超过 2 成" if val_score >= 45
+                              else "基本面偏弱，仅做短线，不重仓持有"))
+        if latest.get("net_profit_yoy") is not None:
+            mid_actions.append(f"最新报告期净利同比 {latest['net_profit_yoy']:+.1f}%、营收同比 "
+                               f"{(latest.get('revenue_yoy') or 0):+.1f}%，作为基本面跟踪锚点")
+    else:
+        mid_actions.append("财务数据不足，中线按技术面轻仓参与，仓位不超过 2 成")
+    if research.get("target_avg"):
+        mid_actions.append(f"研报平均目标价 {research['target_avg']} 元（较现价 {research.get('upside_pct')}%），作中期空间参考")
+    mid_guard = (f"中线逻辑失效：跌破 {swing_low:.2f} 前低"
+                 + (f"或 MA60 {ma60:.2f}" if ma60 else "")
+                 + "；或下一期财报净利同比转负")
+
+    # 计算逻辑说明：参数、取值与规则逐项列出，前端折叠查看
+    indicator_items = [
+        {"label": v["title"], "value": v["value"],
+         "hint": f"{v['desc']}（{'+1' if v['vote'] > 0 else ('-1' if v['vote'] < 0 else '0')} 分）"}
+        for v in indicator.get("votes") or []
+    ]
+    mid_items = [
+        {"label": "价值四维综合", "value": f"{val_score} 分" if val_score is not None else "数据不足",
+         "hint": (valuation or {}).get("verdict") or "财务数据不足"},
+    ]
+    for dim in (valuation or {}).get("dimensions") or []:
+        if dim.get("score") is None:
+            continue
+        facts = "、".join(f"{it['label']} {it['value']}" for it in (dim.get("items") or [])[:2])
+        mid_items.append({"label": dim["title"], "value": f"{dim['score']:.1f} / 25", "hint": facts})
+    mid_items.append({
+        "label": "趋势判定",
+        "value": "多头趋势" if uptrend else "趋势未确认",
+        "hint": (f"价格 {price:.2f}、MA20 {ma20:.2f}、MA60 {ma60:.2f}；"
+                 f"要求价格 > MA20 > MA60 才算多头"),
+    })
+    mid_items.append({"label": "仓位上限", "value": mid_stance, "hint": mid_guard})
+
+    details_sections = [
+        {
+            "title": "八指标依据（日线）",
+            "note": "均线、K线形态、MACD、KDJ、RSI、布林带、量能、支撑压力各投一票，决定明日多空基调。",
+            "items": indicator_items,
+            "formula": "总分 = 八项投票之和（+1 / 0 / -1）；≥ +3 判偏多，≤ -3 判偏空，其余为震荡。",
+        },
+        {
+            "title": "明日区间与参考位",
+            "note": f"现价 {price:.2f}，用近 20 个交易日涨跌幅绝对值的平均作为日均振幅。",
+            "items": [
+                {"label": "日均振幅", "value": f"{amplitude}%", "hint": "近 20 日 |涨跌幅| 均值，截断在 1%~9%"},
+                {"label": "明日预期区间", "value": f"{exp_low:.2f} ~ {exp_high:.2f}", "hint": "现价 ×(1 ± 振幅)"},
+                {"label": "明日参考支撑", "value": f"{near_sup:.2f}", "hint": sup_source},
+                {"label": "明日参考压力", "value": f"{near_res:.2f}", "hint": res_source},
+                {"label": "结构支撑 / 压力", "value": f"{support:.2f} / {resistance:.2f}",
+                 "hint": "近 120 根日线的斐波那契回撤位，用于中线失效判断"},
+            ],
+            "formula": ("区间 = 收盘价 × (1 ± 日均振幅)；参考位优先取现价最近的上/下方均线，"
+                        "距离超过 2 倍振幅时改用区间上/下沿。"),
+        },
+        {
+            "title": "情景概率",
+            "note": f"按多空基调与评分强度分配，当前 {direction}（{score:+d} 分）。",
+            "items": [{"label": s["name"], "value": f"{s['prob']}%", "hint": s["trigger"]} for s in scenarios],
+            "formula": ("偏多：评分 ≥ +5 时上攻给 60%，否则 52%，回落/破位按 6:4 分剩余概率；"
+                        "偏空：评分 ≤ -5 时下探给 60%，否则 52%，止跌 30%，其余为加速下跌；"
+                        "震荡：50% / 25% / 25%。"),
+        },
+        {
+            "title": "短期策略规则",
+            "note": "1-5 个交易日，技术面主导，仓位由八指标总分与过热状态决定。",
+            "items": [
+                {"label": "技术基调", "value": f"{direction}（{score:+d} 分）",
+                 "hint": f"{bull_count} 项偏多 / {bear_count} 项偏空"},
+                {"label": "过热修正", "value": "已触发" if overheated else "未触发",
+                 "hint": (f"J {jv:.1f} / K {kv:.1f} / RSI {rv:.1f}；"
+                          "J>100 或 K>90 或 RSI>75 视为过热，偏多基调降级为「持有不追高」")
+                 if rv is not None else "KDJ：J>100 或 K>90 视为过热"},
+                {"label": "操作参考区间", "value": f"{near_sup:.2f} ~ {near_res:.2f}",
+                 "hint": "取自明日参考支撑 / 压力，用于低吸与减仓"},
+            ],
+            "formula": "偏多 → 低吸持股；偏空 → 降仓防守；震荡 → 半仓区间高抛低吸；跌破参考支撑为短线失效。",
+        },
+        {
+            "title": "中期策略规则",
+            "note": "1-3 个月，价值评分与均线趋势共同决定仓位上限。",
+            "items": mid_items,
+            "formula": ("综合分 = 四维各 25 分合计 ÷ 100 × 100；"
+                        "≥75 逢低配置、≥60 回调分批、≥45 观察、<45 不宜重仓；趋势未确认时一律等右侧确认。"),
+        },
+    ]
+
+    return {
+        "basis": {
+            "indicator": f"八指标 {score:+d} 分 · {indicator.get('direction')}（{bull_count} 多 / {bear_count} 空）",
+            "valuation": ("价值数据不足" if val_score is None
+                          else f"四维 {val_score} 分 · {(valuation or {}).get('verdict') or '暂无结论'}"),
+        },
+        "levels": {"support": round(support, 2), "resistance": round(resistance, 2),
+                   "swing_low": round(swing_low, 2)},
+        "tomorrow": {
+            "bias": indicator.get("direction"),
+            "tone": tone,
+            "confidence": confidence,
+            "amplitude": amplitude,
+            "range": {"low": exp_low, "high": exp_high},
+            "support": round(near_sup, 2),
+            "resistance": round(near_res, 2),
+            "expectation": expect,
+            "scenarios": scenarios,
+            "watch": watch,
+        },
+        "short_term": {"horizon": "1-5 个交易日", "stance": short_stance,
+                       "actions": short_actions, "guard": short_guard},
+        "mid_term": {"horizon": "1-3 个月", "stance": mid_stance,
+                     "actions": mid_actions, "guard": mid_guard},
+        "details": {"sections": details_sections},
     }
 
 

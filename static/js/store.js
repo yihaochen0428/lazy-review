@@ -113,15 +113,16 @@ export async function openStock(code, name = "") {
   await fetchStock();
 }
 
-export async function fetchStock() {
-  state.stock.loading = true;
-  state.stock.error = "";
+export async function fetchStock(silent = false) {
+  if (!silent) state.stock.loading = true;
+  if (!silent) state.stock.error = "";
   try {
     state.stock.data = await api.stock(state.stock.code, state.stock.period);
   } catch (err) {
-    state.stock.error = err.message || "个股数据加载失败";
+    // 静默轮询失败时保留上一次的数据，不打断阅读
+    if (!silent) state.stock.error = err.message || "个股数据加载失败";
   } finally {
-    state.stock.loading = false;
+    if (!silent) state.stock.loading = false;
   }
 }
 
@@ -141,18 +142,22 @@ export function closeOverlays() {
 }
 
 /* ------------------------------------------------------------ 指数研判 */
-export async function loadIndex(code, period = null) {
+export async function loadIndex(code, period = null, { silent = false } = {}) {
   state.indexCode = code;
   if (period) state.indexPeriod = period;
-  state.loading = true;
-  state.error = "";
+  if (!silent) {
+    state.loading = true;
+    state.error = "";
+  }
   try {
     state.indexData = await api.index(code, state.indexPeriod);
   } catch (err) {
-    state.error = err.message || "指数研判数据加载失败";
-    state.indexData = null;
+    if (!silent) {
+      state.error = err.message || "指数研判数据加载失败";
+      state.indexData = null;
+    }
   } finally {
-    state.loading = false;
+    if (!silent) state.loading = false;
   }
 }
 

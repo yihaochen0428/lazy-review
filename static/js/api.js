@@ -25,6 +25,9 @@ export const api = {
   index: (code, period = 101) => request(`/api/index/${code}?klt=${period}`),
   history: () => request("/api/history"),
   news: () => request("/api/news"),
+  newsArchive: (days = 90, impact = "全部", scope = "全部", perDay = 6, day = "") =>
+    request(`/api/news/archive?days=${days}&impact=${encodeURIComponent(impact)}` +
+      `&scope=${encodeURIComponent(scope)}&per_day=${perDay}${day ? `&day=${day}` : ""}`),
   newsAnalyze: (item) =>
     request("/api/news/analyze", {
       method: "POST",
@@ -32,6 +35,8 @@ export const api = {
       body: JSON.stringify(item),
     }),
   abnormal: () => request("/api/abnormal"),
+  tBacktest: (days = 10, force = false) => request(`/api/t/backtest?days=${days}&force=${force}`),
+  openBacktest: (days = 20, force = false) => request(`/api/open/backtest?days=${days}&force=${force}`),
   search: (q) => request(`/api/search?q=${encodeURIComponent(q)}`),
   quotes: (codes) => request(`/api/quotes?codes=${codes.map(encodeURIComponent).join(",")}`),
 };

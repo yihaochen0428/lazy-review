@@ -121,7 +121,7 @@ export default {
           </div>
           <div class="wr-metric">
             <span class="muted">主力净额</span>
-            <b class="num" :class="tone(item.main_flow)">{{ fmtFlow(item.main_flow) }}</b>
+            <b class="num flow-chip" :class="tone(item.main_flow)">{{ fmtFlow(item.main_flow) }}</b>
           </div>
           <div class="wr-metric">
             <span class="muted">成交量</span>

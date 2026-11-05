@@ -4,7 +4,7 @@ import { fmtPct, tone } from "../utils.js";
 
 export default {
   setup() {
-    const { computed, onMounted, ref } = Vue;
+    const { computed, onMounted, onUnmounted, ref, watch } = Vue;
     const group = ref("upcoming");
     const impactFilter = ref("全部");
     const scopeFilter = ref("全部");
@@ -14,9 +14,28 @@ export default {
     const aiError = ref("");
     const eventCat = ref("全部");
 
-    onMounted(() => loadNews());
+    // 历史归档（过去 N 天真实新闻）
+    const history = ref(null);
+    const archLoading = ref(false);
+    const archError = ref("");
+    const range = ref(90);
+    const expanded = ref({});
+    const expanding = ref("");
+    let archTimer = null;
+    let archSeq = 0;
+
+    onMounted(async () => {
+      await loadNews();
+      loadHistory();
+    });
+    onUnmounted(() => {
+      if (archTimer) clearTimeout(archTimer);
+    });
 
     const data = computed(() => state.news.data);
+    const archiveMeta = computed(() => (history.value && history.value.archive)
+      || (data.value && data.value.archive) || {});
+    const archiveStats = computed(() => (history.value && history.value.stats) || null);
 
     function pick(item) {
       selected.value = item;
@@ -40,6 +59,104 @@ export default {
 
     const upcoming = computed(() => filter(data.value?.upcoming));
     const past = computed(() => filter(data.value?.past));
+
+    function dayLabel(date) {
+      if (!date) return "";
+      const now = new Date();
+      const day = new Date(`${date}T00:00:00`);
+      const diff = Math.round((new Date(now.toDateString()) - day) / 86400000);
+      if (diff === 0) return "今天";
+      if (diff === 1) return "昨天";
+      return ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][day.getDay()];
+    }
+
+    const dayCounts = computed(() => {
+      const map = {};
+      ((archiveStats.value && archiveStats.value.days) || []).forEach((d) => {
+        map[d.date] = d.count;
+      });
+      return map;
+    });
+
+    const filtersAll = computed(() => impactFilter.value === "全部" && scopeFilter.value === "全部");
+
+    // 近 N 天每日条数柱状，用于体现 7 / 30 / 90 天的量级差异
+    const dayBars = computed(() => {
+      if (!archiveStats.value) return [];
+      const map = dayCounts.value;
+      const today = new Date();
+      const out = [];
+      for (let i = range.value - 1; i >= 0; i -= 1) {
+        const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - i);
+        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-`
+          + String(d.getDate()).padStart(2, "0");
+        out.push({ date: key, count: map[key] || 0 });
+      }
+      const max = Math.max(1, Math.max(...out.map((b) => b.count)));
+      return out.map((b) => ({
+        ...b,
+        h: b.count ? Math.max(8, Math.round((b.count / max) * 100)) : 2,
+      }));
+    });
+
+    const historyGroups = computed(() => {
+      const items = filter(history.value?.items);
+      const groups = [];
+      items.forEach((n) => {
+        let slot = groups.find((g) => g.date === n.date);
+        if (!slot) {
+          slot = { date: n.date, label: dayLabel(n.date), items: [] };
+          groups.push(slot);
+        }
+        slot.items.push(n);
+      });
+      groups.forEach((g) => {
+        g.total = filtersAll.value ? (dayCounts.value[g.date] || g.items.length) : g.items.length;
+      });
+      return groups;
+    });
+
+    async function loadHistory() {
+      const seq = archSeq + 1;
+      archSeq = seq;
+      archLoading.value = true;
+      try {
+        const payload = await api.newsArchive(range.value, impactFilter.value, scopeFilter.value);
+        if (seq !== archSeq) return;
+        history.value = payload;
+        archError.value = "";
+        if (archTimer) clearTimeout(archTimer);
+        if (payload.archive && payload.archive.running) {
+          archTimer = setTimeout(loadHistory, 15000);
+        }
+      } catch (err) {
+        if (seq === archSeq) archError.value = err.message || "历史新闻加载失败";
+      } finally {
+        if (seq === archSeq) archLoading.value = false;
+      }
+    }
+
+    async function expandDay(date) {
+      if (expanding.value || expanded.value[date]) return;
+      expanding.value = date;
+      try {
+        const payload = await api.newsArchive(range.value, impactFilter.value, scopeFilter.value, 60, date);
+        expanded.value = { ...expanded.value, [date]: payload.items };
+      } catch (err) {
+        archError.value = err.message || "展开失败";
+      } finally {
+        expanding.value = "";
+      }
+    }
+
+    watch([range, impactFilter, scopeFilter], () => {
+      expanded.value = {};
+      if (group.value === "past") loadHistory();
+    });
+    watch(group, (value) => {
+      if (value === "past") loadHistory();
+    });
+
     const list = computed(() => (group.value === "upcoming" ? upcoming.value : past.value));
 
     const events = computed(() => data.value?.events || []);
@@ -79,6 +196,14 @@ export default {
       return impact === "利好" ? "up" : impact === "利空" ? "down" : "muted";
     }
 
+    function scoreItems(score) {
+      return [
+        { label: "影响强度", value: score.intensity || 0 },
+        { label: "持续性", value: score.persistence || 0 },
+        { label: "确定性", value: score.certainty || 0 },
+      ];
+    }
+
     async function analyze() {
       if (!selected.value || aiLoading.value) return;
       aiLoading.value = true;
@@ -94,8 +219,10 @@ export default {
 
     return {
       state, data, group, impactFilter, scopeFilter, selected, ai, aiLoading, aiError,
-      upcoming, past, list, pick, back, impactClass, analyze, loadNews, fmtPct, tone,
+      upcoming, past, list, pick, back, impactClass, scoreItems, analyze, loadNews, fmtPct, tone,
       eventCat, events, hotspots, eventCats, eventGroups, strengthClass, impClass,
+      history, historyGroups, archiveMeta, archiveStats, archLoading, archError, range,
+      loadHistory, dayBars, filtersAll, expanded, expanding, expandDay,
     };
   },
   template: `
@@ -107,10 +234,6 @@ export default {
           聚焦重要新闻、行业政策、行业龙头与未来事件，自动标注利好 / 利空
           <template v-if="data && data.updated_at"> · {{ data.updated_at }} 更新</template>
         </div>
-      </div>
-      <div v-if="data" style="display:flex;gap:8px">
-        <span class="tag gold">未来 {{ data.counts.upcoming }} 条</span>
-        <span class="tag">过去 {{ data.counts.past }} 条</span>
       </div>
     </div>
 
@@ -148,14 +271,126 @@ export default {
           <div v-if="aiError" class="banner error">{{ aiError }}</div>
           <template v-if="ai">
             <div class="ai-summary">{{ ai.summary }}</div>
-            <div class="news-meta" style="margin:10px 0 4px">
+
+            <div class="news-meta" style="margin:12px 0 4px">
               <span class="impact" :class="impactClass(ai.impact)">{{ ai.impact }}</span>
               <span class="tag" v-for="s in ai.sectors" :key="s" class="gold">{{ s }}</span>
-              <span class="tag">{{ ai.upcoming ? '前瞻事件' : '已发生事件' }}</span>
+              <span class="tag" :class="ai.upcoming ? 'hot' : ''">{{ ai.upcoming ? '前瞻事件' : '已发生事件' }}</span>
+              <span class="news-level num" :class="'lv' + ai.level">L{{ ai.level }}</span>
             </div>
-            <ul class="driver-list">
-              <li v-for="d in ai.drivers" :key="d">{{ d }}</li>
-            </ul>
+
+            <div class="ai-score" v-if="ai.score">
+              <div class="ai-score-item" v-for="s in scoreItems(ai.score)" :key="s.label">
+                <div class="ai-score-top">
+                  <span>{{ s.label }}</span><b class="num">{{ s.value }}</b>
+                </div>
+                <div class="ai-score-bar"><i :style="{ width: s.value + '%' }"></i></div>
+              </div>
+            </div>
+
+            <div class="ai-block" v-if="ai.facts && ai.facts.length">
+              <div class="ai-block-head">
+                <span class="ai-index num">1</span>
+                <span class="ai-block-title">关键事实</span>
+              </div>
+              <div class="ai-facts">
+                <div class="ai-fact" v-for="(f, i) in ai.facts" :key="i">
+                  <span class="num">{{ i + 1 }}</span>{{ f }}
+                </div>
+              </div>
+            </div>
+
+            <div class="ai-block" v-if="ai.chain">
+              <div class="ai-block-head">
+                <span class="ai-index num">2</span>
+                <span class="ai-block-title">产业链拆解</span>
+                <span class="tag gold">{{ ai.chain.name }}</span>
+              </div>
+              <div class="ai-chain-row">
+                <div class="ai-chain-col">
+                  <div class="ai-chain-stage">上游</div>
+                  <div class="ai-chain-tags">
+                    <span class="tag" v-for="s in ai.chain.up" :key="s">{{ s }}</span>
+                  </div>
+                </div>
+                <div class="ai-chain-arrow">→</div>
+                <div class="ai-chain-col">
+                  <div class="ai-chain-stage">中游</div>
+                  <div class="ai-chain-tags">
+                    <span class="tag" v-for="s in ai.chain.mid" :key="s">{{ s }}</span>
+                  </div>
+                </div>
+                <div class="ai-chain-arrow">→</div>
+                <div class="ai-chain-col">
+                  <div class="ai-chain-stage">下游</div>
+                  <div class="ai-chain-tags">
+                    <span class="tag" v-for="s in ai.chain.down" :key="s">{{ s }}</span>
+                  </div>
+                </div>
+              </div>
+              <div class="ai-block-body" style="margin-top:10px">{{ ai.chain.logic }}</div>
+            </div>
+
+            <div class="ai-block" v-if="ai.impact_path && ai.impact_path.length">
+              <div class="ai-block-head">
+                <span class="ai-index num">3</span>
+                <span class="ai-block-title">传导路径</span>
+              </div>
+              <div class="ai-steps">
+                <div class="ai-step" v-for="(s, i) in ai.impact_path" :key="s.stage">
+                  <span class="ai-step-idx num">{{ i + 1 }}</span>
+                  <div class="ai-step-body">
+                    <b>{{ s.stage }}</b>
+                    <span>{{ s.text }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="ai-block" v-if="ai.benefit">
+              <div class="ai-block-head">
+                <span class="ai-index num">4</span>
+                <span class="ai-block-title">受益与受损结构</span>
+              </div>
+              <div class="ai-block-body">{{ ai.benefit }}</div>
+            </div>
+
+            <div class="ai-block" v-if="ai.risks && ai.risks.length">
+              <div class="ai-block-head">
+                <span class="ai-index num">5</span>
+                <span class="ai-block-title">风险提示</span>
+              </div>
+              <ul class="ai-list">
+                <li v-for="r in ai.risks" :key="r">{{ r }}</li>
+              </ul>
+            </div>
+
+            <div class="ai-block" v-if="ai.watch && ai.watch.length">
+              <div class="ai-block-head">
+                <span class="ai-index num">6</span>
+                <span class="ai-block-title">后续跟踪指标</span>
+              </div>
+              <ul class="ai-list">
+                <li v-for="w in ai.watch" :key="w">{{ w }}</li>
+              </ul>
+            </div>
+
+            <div class="ai-block" v-if="ai.analogy">
+              <div class="ai-block-head">
+                <span class="ai-index num">7</span>
+                <span class="ai-block-title">历史参照</span>
+              </div>
+              <div class="ai-block-body">{{ ai.analogy }}</div>
+            </div>
+
+            <div class="ai-block" v-if="ai.duration">
+              <div class="ai-block-head">
+                <span class="ai-index num">8</span>
+                <span class="ai-block-title">周期判断</span>
+              </div>
+              <div class="ai-block-body">{{ ai.duration }}</div>
+            </div>
+
             <div class="play-grid" v-if="(ai.leaders && ai.leaders.length) || (ai.small_caps && ai.small_caps.length)">
               <div class="play-col">
                 <div class="play-head">产业龙头 · 业务维度</div>
@@ -194,7 +429,7 @@ export default {
             </div>
           </template>
           <div v-else-if="!aiLoading" class="empty" style="padding:18px 0">
-            点击「AI 分析这条新闻」，自动拆解影响路径、关联板块与持续性
+            点击「AI 分析这条新闻」，自动拆解产业链上下游、传导路径、受益结构、风险与跟踪指标
           </div>
         </div>
       </section>
@@ -292,10 +527,14 @@ export default {
               未来将要发生 ({{ upcoming.length }})
             </button>
             <button class="tab" :class="{ active: group === 'past' }" @click="group = 'past'">
-              过去已发生 ({{ past.length }})
+              过去已发生 · 近 {{ range }} 天
             </button>
           </div>
           <div class="right">
+            <div class="tabs" v-if="group === 'past'">
+              <button class="tab" v-for="d in [7, 30, 90]" :key="d"
+                      :class="{ active: range === d }" @click="range = d">近{{ d }}天</button>
+            </div>
             <div class="tabs">
               <button class="tab" v-for="t in ['全部', '利好', '利空']" :key="t"
                       :class="{ active: impactFilter === t }" @click="impactFilter = t">{{ t }}</button>
@@ -308,8 +547,41 @@ export default {
           </div>
         </div>
 
+        <div v-if="group === 'past'" class="archive-bar">
+          <div class="archive-note" v-if="archiveMeta.running">
+            历史新闻回溯中 · 已收录 {{ archiveMeta.count || 0 }} 条 · 最早到 {{ archiveMeta.crawled_to || '—' }}
+            <button class="ghost-btn" @click="loadHistory">刷新进度</button>
+          </div>
+          <div class="archive-note" v-else-if="archiveMeta.earliest">
+            已归档 {{ archiveMeta.earliest }} ~ {{ archiveMeta.latest }} · 共 {{ archiveMeta.count || 0 }} 条重要新闻
+          </div>
+          <div class="archive-note" v-else>历史新闻准备中，稍后自动刷新…</div>
+          <div class="archive-stats" v-if="archiveStats">
+            <span class="num">近 {{ range }} 天 {{ archiveStats.total || 0 }} 条</span>
+            <span class="num up">利好 {{ archiveStats.impacts['利好'] || 0 }}</span>
+            <span class="num down">利空 {{ archiveStats.impacts['利空'] || 0 }}</span>
+            <span class="num flat">中性 {{ archiveStats.impacts['中性'] || 0 }}</span>
+          </div>
+        </div>
+
+        <div v-if="group === 'past' && archError" class="banner error">{{ archError }}</div>
+
+        <div v-if="group === 'past' && dayBars.length" class="archive-hist">
+          <div class="archive-hist-bars">
+            <div class="bar" v-for="b in dayBars" :key="b.date"
+                 :class="{ empty: !b.count }" :style="{ height: b.h + '%' }"
+                 :title="b.date + ' · ' + b.count + ' 条'"></div>
+          </div>
+          <div class="archive-hist-foot">
+            <span>{{ dayBars[0].date }}</span>
+            <span>每日重要新闻条数</span>
+            <span>今天</span>
+          </div>
+        </div>
+
         <div v-if="state.news.loading && !data" class="skeleton" style="height:320px"></div>
-        <div class="news-list" v-else-if="list.length">
+
+        <div class="news-list" v-else-if="group === 'upcoming' && list.length">
           <a class="news-item" v-for="n in list" :key="n.title" href="javascript:void(0)"
              @click.prevent="pick(n)">
             <span class="news-time num">{{ n.time_text }}</span>
@@ -325,7 +597,37 @@ export default {
             <span class="news-level num" :class="'lv' + n.level">L{{ n.level }}</span>
           </a>
         </div>
-        <div v-else class="empty">该分组暂无符合条件的新闻</div>
+
+        <div class="news-list archive-list" v-else-if="group === 'past' && historyGroups.length">
+          <div class="archive-group" v-for="g in historyGroups" :key="g.date">
+            <div class="archive-date">
+              <span class="num">{{ g.date }}</span>
+              <span class="muted small">{{ g.label }} · {{ g.total }} 条</span>
+              <button v-if="filtersAll && !expanded[g.date] && g.total > g.items.length"
+                      class="ghost-btn archive-more" @click="expandDay(g.date)">
+                {{ expanding === g.date ? '加载中…' : '展开全部' }}
+              </button>
+              <span v-else-if="g.total > g.items.length" class="muted small">仅显示重点 {{ g.items.length }} 条</span>
+            </div>
+            <a class="news-item" v-for="n in (expanded[g.date] || g.items)" :key="n.id || n.ts" href="javascript:void(0)"
+               @click.prevent="pick(n)">
+              <span class="news-time num">{{ n.time_text }}</span>
+              <span class="news-scope" :class="n.scope === '国际' ? 'intl' : ''">{{ n.scope }}</span>
+              <div class="news-main">
+                <div class="news-title">{{ n.title }}</div>
+                <div class="news-meta">
+                  <span class="impact" :class="impactClass(n.impact)">{{ n.impact }}</span>
+                  <span class="tag" v-for="tag in n.tags" :key="tag">{{ tag }}</span>
+                  <span class="news-src">{{ n.source }}</span>
+                </div>
+              </div>
+              <span class="news-level num" :class="'lv' + n.level">L{{ n.level }}</span>
+            </a>
+          </div>
+        </div>
+        <div v-else class="empty">
+          {{ group === 'past' ? '该时间范围内暂无归档新闻，历史回溯可能需要几分钟' : '该分组暂无符合条件的新闻' }}
+        </div>
       </section>
     </template>
   </div>`,

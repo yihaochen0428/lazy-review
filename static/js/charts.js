@@ -172,42 +172,106 @@ function chanOverlay(bars, dates, chan) {
   };
 }
 
+function minToTime(m) {
+  return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+}
+
+// A股分时横轴：09:30-11:30 + 13:00-15:00，共 240 分钟，午休不占宽度
+function intradaySlots(scale = 5) {
+  const slots = ["09:30"];
+  for (let m = 570 + scale; m <= 690; m += scale) slots.push(minToTime(m));
+  for (let m = 780 + scale; m <= 900; m += scale) slots.push(minToTime(m));
+  return slots;
+}
+
 export function intradayOption(data, indicator = "MACD") {
   const intra = data.intraday || {};
   const bars = intra.bars || data.bars || [];
-  const times = bars.map((b) => b.time || String(b.date).slice(11, 16));
+  const barTimes = bars.map((b) => b.time || String(b.date).slice(11, 16));
   const prevClose = intra.prev_close || (bars[0] && bars[0].open);
   const closes = bars.map((b) => b.close);
   const vwap = intra.vwap || [];
   const hasVwap = vwap.some((v) => v != null);
   const points = intra.t_points || [];
   const series = data.series || {};
+
+  // 横轴固定铺满全天 240 分钟：已发生的 K 线落在对应槽位，未交易时段留空，
+  // 避免盘中只有半日数据时被强行拉伸铺满整幅（与同花顺/东财版式一致）
+  const scale = (() => {
+    if (bars.length < 2) return 5;
+    const mins = (t) => Number(t.slice(0, 2)) * 60 + Number(t.slice(3, 5));
+    const d = mins(barTimes[1]) - mins(barTimes[0]);
+    return d > 0 && d <= 60 ? d : 5;
+  })();
+  const slots = intradaySlots(scale);
+  const slotIndex = new Map(slots.map((t, i) => [t, i]));
+  const slotToBar = new Map();
+  barTimes.forEach((t, i) => {
+    const si = slotIndex.get(t);
+    if (si !== undefined) slotToBar.set(si, i);
+  });
+  // 首根 K 线的开盘价即 09:30 集合竞价点，补出该点让分时线从最左端起步
+  const openFill = bars.length && barTimes[0] !== "09:30"
+    ? (bars[0].open != null ? bars[0].open : closes[0])
+    : null;
+  const place = (values, fillFirst = null) => {
+    const out = new Array(slots.length).fill(null);
+    if (fillFirst != null) out[0] = fillFirst;
+    values.forEach((v, i) => {
+      const si = slotIndex.get(barTimes[i]);
+      if (si !== undefined) out[si] = v;
+    });
+    return out;
+  };
+  const closeLine = place(closes, openFill);
+  const vwapLine = place(vwap);
+  const volumeLine = place(bars.map((b) => b.volume));
+
+  // 横轴刻度：09:30 / 10:30 / 11:30·13:00（午休合并） / 14:00 / 15:00
+  const noonIdx = 1 + Math.round((690 - 570) / scale);
+  const middaySlot = slots[noonIdx - 1];
+  const labelSet = new Set(["09:30", "10:30", "15:00"]);
+  [middaySlot, slots[noonIdx + Math.round((900 - 780) / scale / 2)]].forEach((t) => {
+    if (t) labelSet.add(t);
+  });
+  const labelText = (t) => (t === middaySlot ? "11:30/13:00" : t);
   // 与主流软件一致：以昨收为中心，价格轴与右侧百分比轴共用对称空间
   const devMax = closes.reduce((m, c) => Math.max(m, Math.abs((c / prevClose - 1) * 100)), 0);
   const vwapMax = vwap.reduce((m, v) => (v == null ? m : Math.max(m, Math.abs((v / prevClose - 1) * 100))), 0);
   const limitPct = Math.max(1, Math.ceil(Math.max(devMax, vwapMax) * 1.15 * 2) / 2);
 
-  // 做T点位：value 使用数组，formatter 统一从 p.value 取值（对象 data 时 p.data[2] 会取不到）
-  const tData = points.map((p) => ({
-    value: [p.index, p.price, p.type === "buy" ? "T买" : "T卖", p.reason || "", p.strategy || ""],
-    label: { position: p.type === "buy" ? "bottom" : "top" },
-    itemStyle: {
-      color: p.type === "buy" ? GOLD : BLUE,
-      borderColor: "#0a0e15",
-      borderWidth: 1,
-    },
-  }));
+  // 做T点位：p.index 是 bars 下标，需换算成横轴槽位
+  const tData = points
+    .map((p) => {
+      const si = slotIndex.get(barTimes[p.index]);
+      if (si === undefined) return null;
+      return {
+        value: [si, p.price, p.type === "buy" ? "T买" : "T卖", p.reason || "", p.strategy || ""],
+        label: { position: p.type === "buy" ? "bottom" : "top" },
+        itemStyle: {
+          color: p.type === "buy" ? GOLD : BLUE,
+          borderColor: "#0a0e15",
+          borderWidth: 1,
+        },
+      };
+    })
+    .filter(Boolean);
 
-  // 以昨收为界拆分分时线：水上红、水下绿，并在穿越点补点避免断线
+  // 以昨收为界拆分分时线：水上红、水下绿，并在穿越点补点避免断线（空槽位跳过）
   const above = [];
   const below = [];
-  closes.forEach((c, i) => {
+  closeLine.forEach((c, i) => {
+    if (c == null) { above.push(null); below.push(null); return; }
     const up = prevClose ? c >= prevClose : true;
     above.push(up ? c : null);
     below.push(up ? null : c);
-    if (i > 0 && prevClose && (closes[i - 1] >= prevClose) !== up) {
-      above[i - 1] = closes[i - 1];
-      below[i - 1] = closes[i - 1];
+    if (i > 0 && prevClose) {
+      let j = i - 1;
+      while (j >= 0 && closeLine[j] == null) j -= 1;
+      if (j >= 0 && (closeLine[j] >= prevClose) !== up) {
+        above[j] = closeLine[j];
+        below[j] = closeLine[j];
+      }
     }
   });
 
@@ -228,8 +292,10 @@ export function intradayOption(data, indicator = "MACD") {
       padding: [8, 10],
       formatter: (params) => {
         if (!params || !params.length) return "";
-        const bar = params[0];
-        const i = bar.dataIndex;
+        const slot = params[0].dataIndex;
+        const bi = slotToBar.get(slot);
+        if (bi === undefined) return "";  // 空槽位（未交易时段）不弹提示
+        const i = bi;
         const b = bars[i] || {};
         const c = b.close;
         const p = prevClose ? ((c / prevClose - 1) * 100) : 0;
@@ -249,9 +315,16 @@ export function intradayOption(data, indicator = "MACD") {
       { left: 52, right: 46, top: "78%", height: "15%" },
     ],
     xAxis: [
-      { ...AXIS, type: "category", data: times, gridIndex: 0, boundaryGap: false, axisLabel: { show: false }, splitLine: { show: false } },
-      { ...AXIS, type: "category", data: times, gridIndex: 1, boundaryGap: true, axisLabel: { show: false }, splitLine: { show: false } },
-      { ...AXIS, type: "category", data: times, gridIndex: 2, boundaryGap: true, axisLabel: { color: "#6c7789", fontSize: 10 }, splitLine: { show: false } },
+      { ...AXIS, type: "category", data: slots, gridIndex: 0, boundaryGap: false, axisLabel: { show: false }, splitLine: { show: false } },
+      { ...AXIS, type: "category", data: slots, gridIndex: 1, boundaryGap: true, axisLabel: { show: false }, splitLine: { show: false } },
+      {
+        ...AXIS, type: "category", data: slots, gridIndex: 2, boundaryGap: true, splitLine: { show: false },
+        axisLabel: {
+          color: "#6c7789", fontSize: 10,
+          interval: (index, value) => labelSet.has(value),
+          formatter: (value) => labelText(value),
+        },
+      },
     ],
     yAxis: [
       {
@@ -306,7 +379,7 @@ export function intradayOption(data, indicator = "MACD") {
         },
       },
       ...(hasVwap ? [{
-        type: "line", name: "均价线", data: vwap, showSymbol: false,
+        type: "line", name: "均价线", data: vwapLine, showSymbol: false,
         lineStyle: { color: GOLD, width: 1.1, type: "solid" },
       }] : []),
       ...(points.length ? [{
@@ -326,12 +399,18 @@ export function intradayOption(data, indicator = "MACD") {
         z: 8,
       }] : []),
       {
-        type: "bar", name: "成交量", data: bars.map((b, i) => ({
-          value: b.volume,
-          itemStyle: { color: i > 0 && b.close < bars[i - 1].close ? "rgba(20,195,154,.55)" : "rgba(255,80,99,.55)" },
-        })), xAxisIndex: 1, yAxisIndex: 1, barWidth: "62%",
+        type: "bar", name: "成交量", xAxisIndex: 1, yAxisIndex: 1, barWidth: "70%",
+        data: volumeLine.map((v, si) => {
+          const bi = slotToBar.get(si);
+          if (v == null || bi === undefined) return null;
+          const prev = bi > 0 ? bars[bi - 1].close : (prevClose || bars[bi].open);
+          const down = bars[bi].close < prev;
+          return { value: v, itemStyle: { color: down ? "rgba(20,195,154,.55)" : "rgba(255,80,99,.55)" } };
+        }),
       },
-      ...indicatorSeries(series, indicator).map((s) => ({ ...s, xAxisIndex: 2, yAxisIndex: 2 })),
+      ...indicatorSeries(series, indicator).map((s) => ({
+        ...s, data: place(s.data || []), xAxisIndex: 2, yAxisIndex: 2,
+      })),
     ],
   };
 }

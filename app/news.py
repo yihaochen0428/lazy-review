@@ -1,6 +1,8 @@
 """重要新闻聚合：华尔街见闻实时快讯 + 新浪财经滚动，按影响力打分归类"""
+import hashlib
 import json
 import re
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -8,7 +10,8 @@ from datetime import datetime, timedelta
 
 from . import eastmoney as em
 from . import ths
-from .db import cached_call
+from .db import (cached_call, news_archive_put, news_archive_query, news_archive_span,
+                 news_archive_stats)
 
 WSCN_LIVE = "https://api-one.wallstcn.com/apiv1/content/lives?channel={channel}&client=pc&limit=40"
 SINA_ROLL = ("https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&num=30&page=1")
@@ -75,9 +78,10 @@ def _fetch(url: str, headers=None, timeout: int = 10, retries: int = 2):
     raise RuntimeError(f"新闻源请求失败：{last}")
 
 
-def _wscn(channel: str):
-    payload = json.loads(_fetch(WSCN_LIVE.format(channel=channel)))
-    items = ((payload.get("data") or {}).get("items")) or []
+def _wscn(channel: str, cursor=None):
+    payload = json.loads(_fetch(WSCN_LIVE.format(channel=channel) + (f"&cursor={cursor}" if cursor else "")))
+    data = payload.get("data") or {}
+    items = data.get("items") or []
     rows = []
     for item in items:
         title = (item.get("title") or "").strip()
@@ -95,7 +99,7 @@ def _wscn(channel: str):
             "score": float(item.get("score") or 0),
             "source": "华尔街见闻",
         })
-    return rows
+    return rows, data.get("next_cursor")
 
 
 def _sina():
@@ -377,6 +381,141 @@ def fetch_events(days: int = 21, limit: int = 120):
     return cached_call(f"events:v7:{start}:{days}:{limit}", 1800, producer)
 
 
+# ---------------------------------------------------------------- 历史新闻归档
+ARCHIVE_CHANNELS = ("a-stock-channel", "global-channel")
+ARCHIVE_DAYS = 95          # 至少覆盖过去 3 个月
+_archive_lock = threading.Lock()
+_archive_state = {"running": False, "oldest": None, "error": "", "started": 0, "done_at": 0}
+
+
+def _archive_row(item):
+    ts = int(item.get("time") or 0)
+    return {
+        "id": hashlib.sha1(f"{item.get('url') or ''}|{item.get('title')}|{ts}"
+                           .encode("utf-8")).hexdigest()[:20],
+        "ts": ts,
+        "date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d"),
+        "title": item.get("title") or "",
+        "summary": item.get("summary") or "",
+        "url": item.get("url") or "",
+        "source": item.get("source") or "",
+        "scope": item.get("scope") or "国内",
+        "impact": item.get("impact") or "中性",
+        "level": item.get("level") or 1,
+        "tags": item.get("tags") or [],
+        "category": (item.get("tags") or [""])[0],
+        "upcoming": item.get("upcoming"),
+    }
+
+
+def _crawl_channel(channel: str, stop_ts: float, max_pages: int = 800) -> int:
+    """从最新快讯向历史翻页，写入归档直至覆盖 stop_ts"""
+    cursor, pages, saved, oldest, fails = None, 0, 0, None, 0
+    while pages < max_pages:
+        try:
+            rows, cursor = _wscn(channel, cursor)
+            fails = 0
+        except Exception:  # noqa: BLE001
+            fails += 1
+            if fails >= 3:
+                break
+            time.sleep(0.8 * fails)
+            continue
+        if not rows:
+            break
+        keep = []
+        for row in rows:
+            if row["time"] < stop_ts or not row["time"]:
+                continue
+            item = _classify(row)
+            if item["level"] < 2:
+                continue
+            keep.append(_archive_row(item))
+        saved += news_archive_put(keep)
+        pages += 1
+        page_oldest = min(r["time"] for r in rows)
+        oldest = page_oldest if oldest is None else min(oldest, page_oldest)
+        with _archive_lock:
+            if oldest and (_archive_state["oldest"] is None or oldest < _archive_state["oldest"]):
+                _archive_state["oldest"] = oldest
+        if page_oldest < stop_ts or not cursor:
+            break
+        time.sleep(0.1)
+    return saved
+
+
+def _archive_worker(days: int):
+    stop_ts = time.time() - days * 86400
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(_crawl_channel, ch, stop_ts) for ch in ARCHIVE_CHANNELS]
+            for future in futures:
+                future.result()
+    except Exception as exc:  # noqa: BLE001
+        with _archive_lock:
+            _archive_state["error"] = str(exc)
+    finally:
+        with _archive_lock:
+            _archive_state["running"] = False
+            _archive_state["done_at"] = time.time()
+
+
+def ensure_archive(days: int = ARCHIVE_DAYS) -> bool:
+    """归档覆盖不足时启动后台回溯（首次约数分钟），返回是否已启动"""
+    with _archive_lock:
+        if _archive_state["running"]:
+            return False
+        if _archive_state["done_at"] and time.time() - _archive_state["done_at"] < 600:
+            return False
+        span = news_archive_span()
+        need_since = time.time() - (days - 1) * 86400
+        if span["count"] and (span["min"] or 0) <= need_since:
+            return False
+        _archive_state.update(running=True, started=time.time(), error="",
+                              oldest=span["min"], done_at=0)
+    threading.Thread(target=_archive_worker, args=(days,), daemon=True).start()
+    return True
+
+
+def archive_meta():
+    ensure_archive()
+    span = news_archive_span()
+    with _archive_lock:
+        running = _archive_state["running"]
+        oldest = _archive_state["oldest"]
+        error = _archive_state["error"]
+    fmt_day = lambda ts: datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""  # noqa: E731
+    return {
+        "running": running,
+        "count": span["count"] or 0,
+        "earliest": fmt_day(span["min"]),
+        "latest": fmt_day(span["max"]),
+        "crawled_to": fmt_day(oldest),
+        "error": error,
+    }
+
+
+def archive_payload(days: int = 90, impact: str = "全部", scope: str = "全部",
+                    per_day: int = 6, day: str = ""):
+    """近 N 天归档：默认每天只返回最重要的 per_day 条，day 用于展开单日全量"""
+    ensure_archive()
+    end = time.time()
+    start = end - days * 86400
+    items = news_archive_query(
+        int(start), int(end), impact, scope,
+        limit=600, per_day=None if day else per_day, day=day or None)
+    for item in items:
+        item["time_text"] = datetime.fromtimestamp(item["ts"]).strftime("%m-%d %H:%M")
+    stats = news_archive_stats(int(start), int(end))
+    return {
+        "items": items,
+        "stats": stats,
+        "days": days,
+        "day": day,
+        "archive": archive_meta(),
+    }
+
+
 def fetch_news(limit: int = 22):
     def producer():
         rows = []
@@ -385,9 +524,10 @@ def fetch_news(limit: int = 22):
                        pool.submit(_sina)]
         for future in futures:
             try:
-                rows.extend(future.result())
+                value = future.result()
             except Exception:  # noqa: BLE001
                 continue
+            rows.extend(value[0] if isinstance(value, tuple) else value)
         seen, unique = set(), []
         for row in sorted(rows, key=lambda r: r["time"], reverse=True):
             text = row["title"]
@@ -406,13 +546,19 @@ def fetch_news(limit: int = 22):
             groups[item["scope"]].append(item)
         upcoming = [i for i in picked if i["upcoming"]]
         past = [i for i in picked if not i["upcoming"]]
+        try:
+            news_archive_put([_archive_row(i) for i in picked])
+        except Exception:  # noqa: BLE001
+            pass
+        ensure_archive()
         return {
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "items": picked,
             "groups": groups,
             "upcoming": upcoming,
             "past": past,
-            "counts": {k: len(v) for k, v in groups.items()},
+            "counts": {**{k: len(v) for k, v in groups.items()},
+                       "upcoming": len(upcoming), "past": len(past)},
         }
 
     return cached_call("news", NEWS_TTL, producer)

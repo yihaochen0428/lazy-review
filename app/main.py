@@ -1,5 +1,6 @@
 """懒得复盘 - FastAPI 服务入口"""
 import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -8,6 +9,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import market
+from . import news as news_src
 from . import eastmoney as em
 from .analysis import NOISE_CONCEPTS
 from .config import STATIC_DIR, LLM_API_KEY, LLM_MODEL
@@ -21,10 +23,44 @@ def _warmup():
         pass
 
 
+def _refresh_snapshot():
+    try:
+        market.build_dashboard(force=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _midnight_refresh():
+    """24:00：先归档当日新闻，再用新新闻重建明日推演快照"""
+    try:
+        news_src.ensure_archive()
+    except Exception:  # noqa: BLE001
+        pass
+    _refresh_snapshot()
+
+
+def _scheduler():
+    """策略统一刷新时点：09:25 竞价 / 15:00 收盘 / 24:00 隔夜新闻推演"""
+    last = {}
+    while True:
+        now = datetime.now()
+        stamp = now.strftime("%Y%m%d")
+        for key, target, worker in (
+            ("09:25", (9, 25), _refresh_snapshot),
+            ("15:00", (15, 0), _refresh_snapshot),
+            ("24:00", (0, 0), _midnight_refresh),
+        ):
+            if (now.hour, now.minute) == target and last.get(key) != stamp:
+                last[key] = stamp
+                threading.Thread(target=worker, daemon=True).start()
+        time.sleep(20)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     threading.Thread(target=_warmup, daemon=True).start()
+    threading.Thread(target=_scheduler, daemon=True).start()
     yield
 
 
@@ -120,6 +156,32 @@ def news_page():
         return market.news_page()
     except Exception as exc:  # noqa: BLE001
         return fail(f"新闻获取失败：{exc}")
+
+
+@app.get("/api/news/archive")
+def news_archive(days: int = Query(default=90), impact: str = Query(default="全部"),
+                 scope: str = Query(default="全部"), per_day: int = Query(default=6),
+                 day: str = Query(default="")):
+    try:
+        return market.news_history(days, impact, scope, per_day, day)
+    except Exception as exc:  # noqa: BLE001
+        return fail(f"历史新闻获取失败：{exc}")
+
+
+@app.get("/api/t/backtest")
+def t_backtest(days: int = Query(default=10), force: bool = Query(default=False)):
+    try:
+        return market.t_backtest(days, force)
+    except Exception as exc:  # noqa: BLE001
+        return fail(f"做T回测失败：{exc}")
+
+
+@app.get("/api/open/backtest")
+def open_backtest(days: int = Query(default=20), force: bool = Query(default=False)):
+    try:
+        return market.open_backtest(days, force)
+    except Exception as exc:  # noqa: BLE001
+        return fail(f"开盘策略回测失败：{exc}")
 
 
 @app.post("/api/news/analyze")

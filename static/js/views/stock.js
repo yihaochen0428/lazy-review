@@ -1,7 +1,8 @@
-import { closeStock, isWatched, openStock, state, switchPeriod, toggleWatch } from "../store.js";
+import { closeStock, fetchStock, isWatched, openStock, state, switchPeriod, toggleWatch } from "../store.js";
+import { api } from "../api.js";
 import { Chart, MiniCandle } from "../components.js";
 import { intradayOption, klineOption } from "../charts.js";
-import { fmtAmount, fmtNumber, fmtPct, fmtPrice, tone } from "../utils.js";
+import { fmtAmount, fmtNumber, fmtPct, fmtPrice, isMarketOpen, tone } from "../utils.js";
 
 function lastValue(series) {
   if (!series) return null;
@@ -11,22 +12,51 @@ function lastValue(series) {
   return null;
 }
 
+// 指标卡片排序偏好：只存本地，不依赖账号
+const IND_ORDER_KEY = "lazy-review:ind-order";
+const IND_LOCK_KEY = "lazy-review:ind-lock";
+
+function readIndOrder() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(IND_ORDER_KEY) || "[]");
+    return Array.isArray(arr) ? arr.map(String) : [];
+  } catch (err) {
+    return [];
+  }
+}
+
 export default {
   components: { Chart, MiniCandle },
   setup() {
-    const { computed, ref } = Vue;
+    const { computed, onMounted, onUnmounted, ref, watch } = Vue;
     const indicator = ref("MACD");
     const chanOn = ref(false);
+    const detailsEl = ref(null);
+    // 指标卡片：拖拽排序 + 锁定
+    const indOrder = ref(readIndOrder());
+    const indLocked = ref(localStorage.getItem(IND_LOCK_KEY) === "1");
+    const dragKey = ref(null);
+    const dragOverKey = ref(null);
     const data = computed(() => state.stock.data);
     const meta = computed(() => (data.value && data.value.meta) || {});
     const series = computed(() => (data.value && data.value.series) || {});
     const ind = computed(() => (data.value && data.value.indicator) || null);
+    const orderedVotes = computed(() => {
+      const votes = (ind.value && ind.value.votes) || [];
+      const order = indOrder.value;
+      const byKey = new Map(votes.map((v) => [v.key, v]));
+      const out = order.map((k) => byKey.get(k)).filter(Boolean);
+      votes.forEach((v) => { if (!order.includes(v.key)) out.push(v); });
+      return out;
+    });
     const ctx = computed(() => (data.value && data.value.context) || null);
     const report = computed(() => ctx.value?.research || null);
     const boards = computed(() => ctx.value?.boards || []);
     const events = computed(() => ctx.value?.events || []);
     const valuation = computed(() => (data.value && data.value.valuation) || null);
     const chan = computed(() => (data.value && data.value.chan) || null);
+    const analysis = computed(() => (data.value && data.value.analysis) || null);
+    const strategy = computed(() => (data.value && data.value.strategy) || null);
     const intra = computed(() => (data.value && data.value.intraday) || null);
     const isIntraday = computed(() => state.stock.period === 105);
     const watched = computed(() => isWatched(state.stock.code));
@@ -119,15 +149,123 @@ export default {
     const valDims = computed(() => (valuation.value && valuation.value.dimensions) || []);
     const tStrategies = computed(() => Object.values((intra.value && intra.value.stats) || {}));
     const chanFuture = computed(() => (chan.value && chan.value.future) || null);
+    const tEnv = computed(() => (intra.value && intra.value.env) || null);
+    const advice = computed(() => (data.value && data.value.open_advice) || null);
+
+    const bt = ref(null);
+    const btLoading = ref(false);
+    const btError = ref("");
+    async function loadBt(force = false) {
+      if (btLoading.value) return;
+      btLoading.value = true;
+      btError.value = "";
+      try {
+        bt.value = await api.tBacktest(10, force);
+      } catch (err) {
+        btError.value = err && err.message ? err.message : String(err);
+      } finally {
+        btLoading.value = false;
+      }
+    }
+
+    const ob = ref(null);
+    const obLoading = ref(false);
+    const obError = ref("");
+    async function loadOb(force = false) {
+      if (obLoading.value) return;
+      obLoading.value = true;
+      obError.value = "";
+      try {
+        ob.value = await api.openBacktest(20, force);
+      } catch (err) {
+        obError.value = err && err.message ? err.message : String(err);
+      } finally {
+        obLoading.value = false;
+      }
+    }
+
+    // 弹窗停留在分时页时每 30 秒静默刷新行情；指标分析结论按 09:25 / 15:00 / 24:00 换挡更新
+    let timer = null;
+    onMounted(() => {
+      loadOb(false);
+      timer = window.setInterval(() => {
+        if (!state.stock.open || state.stock.period !== 105) return;
+        if (!isMarketOpen()) return;
+        fetchStock(true);
+      }, 30000);
+    });
+    onUnmounted(() => {
+      if (timer) window.clearInterval(timer);
+    });
+
+    // 首次进入分时页时拉取一次环境过滤回测（服务端缓存 30 分钟）
+    watch(isIntraday, (on) => {
+      if (on && !bt.value && !btLoading.value) loadBt(false);
+    }, { immediate: true });
 
     function onMask(event) {
       if (event.target.classList.contains("modal-mask")) closeStock();
     }
 
+    function closeDetails() {
+      if (detailsEl.value) detailsEl.value.open = false;
+    }
+
+    function saveIndOrder() {
+      localStorage.setItem(IND_ORDER_KEY, JSON.stringify(indOrder.value));
+    }
+
+    function onIndDragStart(item, event) {
+      if (indLocked.value) {
+        event.preventDefault();
+        return;
+      }
+      dragKey.value = item.key;
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", item.key);
+      }
+    }
+
+    function onIndDrop(target) {
+      const from = dragKey.value;
+      dragKey.value = null;
+      dragOverKey.value = null;
+      if (indLocked.value || !from || from === target.key) return;
+      const keys = orderedVotes.value.map((v) => v.key);
+      const i = keys.indexOf(from);
+      const j = keys.indexOf(target.key);
+      if (i < 0 || j < 0) return;
+      keys.splice(j, 0, keys.splice(i, 1)[0]);
+      indOrder.value = keys;
+      saveIndOrder();
+    }
+
+    function onIndDragEnd() {
+      dragKey.value = null;
+      dragOverKey.value = null;
+    }
+
+    function toggleIndLock() {
+      indLocked.value = !indLocked.value;
+      localStorage.setItem(IND_LOCK_KEY, indLocked.value ? "1" : "0");
+    }
+
+    function resetIndOrder() {
+      indOrder.value = [];
+      localStorage.removeItem(IND_ORDER_KEY);
+      dragKey.value = null;
+      dragOverKey.value = null;
+    }
+
     return {
-      state, data, meta, tech, chartOption, infoRows, fibRows, indicator, ind, ctx, report, boards, events,
+      state, data, meta, tech, chartOption, infoRows, fibRows, indicator, ind, ctx, report, boards, events, analysis, strategy,
       watched, researchWindows, toggleStar, valuation, chan, chanOn, chanPoints, chanLevels, intra, isIntraday,
+      detailsEl, closeDetails,
+      orderedVotes, indOrder, indLocked, dragKey, dragOverKey,
+      onIndDragStart, onIndDrop, onIndDragEnd, toggleIndLock, resetIndOrder,
       tPoints, financeRows, industryReports, valuationNotes, valDims, tStrategies, chanFuture,
+      tEnv, bt, btLoading, btError, loadBt, advice, ob, obLoading, obError, loadOb,
       closeStock, switchPeriod, onMask, openStock, fmtAmount, fmtNumber, fmtPct, fmtPrice, tone,
     };
   },
@@ -164,11 +302,92 @@ export default {
             <button v-if="!isIntraday" class="chip" :class="{active: chanOn}" @click="chanOn = !chanOn">缠论K线</button>
           </div>
 
+          <div class="oa-card" v-if="advice">
+            <div class="oa-head">
+              <span class="tag hot">开盘买入决策</span>
+              <span class="muted small">{{ advice.phase }} · {{ advice.updated_at }}</span>
+              <span class="oa-action" :class="advice.level === 'high' ? 'up' : (advice.level === 'low' ? 'down' : '')">{{ advice.action }}</span>
+              <span class="oa-pos">建议仓位 {{ advice.position }}</span>
+            </div>
+            <div class="oa-row">
+              <div class="oa-item">
+                <span class="oa-label">指数竞价</span>
+                <span class="num" :class="tone(advice.index.gap_pct)">{{ advice.index.gap_pct === null ? '-' : fmtPct(advice.index.gap_pct) }}</span>
+                <span class="oa-sub">{{ advice.index.label }}</span>
+              </div>
+              <div class="oa-item">
+                <span class="oa-label">板块竞价</span>
+                <span class="num" :class="tone(advice.sector.gap_pct)">{{ advice.sector.gap_pct === null ? '-' : fmtPct(advice.sector.gap_pct) }}</span>
+                <span class="oa-sub">{{ advice.sector.name || '未匹配' }}<template v-if="advice.sector.etf"> · {{ advice.sector.etf }}</template></span>
+              </div>
+              <div class="oa-item">
+                <span class="oa-label">个股竞价</span>
+                <span class="num" :class="tone(advice.stock.gap_pct)">{{ advice.stock.gap_pct === null ? '-' : fmtPct(advice.stock.gap_pct) }}</span>
+                <span class="oa-sub">相对板块 {{ advice.stock.relative }}</span>
+              </div>
+              <div class="oa-item">
+                <span class="oa-label">综合分</span>
+                <span class="num" :class="tone(advice.score)">{{ advice.score }}</span>
+                <span class="oa-sub">{{ advice.label }}</span>
+              </div>
+              <div class="oa-item" v-if="advice.dk">
+                <span class="oa-label">日K 背景</span>
+                <span class="num" :class="tone(advice.dk.score)">{{ fmtNumber(advice.dk.score, 2) }}</span>
+                <span class="oa-sub">{{ advice.dk.label }} · MA20 偏离 {{ advice.dk.dev20 }}%</span>
+              </div>
+              <div class="oa-item" v-if="advice.market">
+                <span class="oa-label">大盘环境</span>
+                <span class="num" :class="tone(advice.market.score)">{{ fmtNumber(advice.market.score, 2) }}</span>
+                <span class="oa-sub">情绪 {{ advice.market.sent.score }} {{ advice.market.sent.label }} · {{ advice.market.forecast.pattern }}</span>
+              </div>
+              <div class="oa-item" v-if="advice.sector_dk">
+                <span class="oa-label">板块日K</span>
+                <span class="num" :class="tone(advice.sector_dk.score)">{{ fmtNumber(advice.sector_dk.score, 2) }}</span>
+                <span class="oa-sub">{{ advice.sector_dk.label }} · MA20 偏离 {{ advice.sector_dk.dev20 }}%</span>
+              </div>
+              <div class="oa-item" v-if="advice.catalyst">
+                <span class="oa-label">催化</span>
+                <span class="num" :class="tone(advice.catalyst.score || 0)">{{ advice.catalyst.score === null ? '-' : fmtNumber(advice.catalyst.score, 2) }}</span>
+                <span class="oa-sub">{{ advice.catalyst.news.label }} · {{ advice.catalyst.overseas.label }}</span>
+              </div>
+            </div>
+            <div class="oa-reason">{{ advice.reason }}</div>
+            <div class="oa-regime" v-if="advice.plan">
+              <span class="tag">大盘剧本</span>
+              <span>{{ advice.plan.regime }} · 仓位上限 {{ advice.plan.cap }} 成 · {{ advice.plan.why }}</span>
+            </div>
+            <div class="oa-regime" v-if="advice.catalyst && advice.catalyst.news.items && advice.catalyst.news.items.length">
+              <span class="tag">消息</span>
+              <span>{{ advice.catalyst.news.items[0].impact }} · {{ advice.catalyst.news.items[0].title }}</span>
+            </div>
+            <div class="oa-levels">
+              <span><em>买点</em>{{ advice.entry }}</span>
+              <span><em>止损</em>{{ advice.stop }}</span>
+              <span><em>目标</em>{{ advice.target }}</span>
+            </div>
+            <div class="oa-plans">
+              <div class="oa-plan" v-for="(p, i) in advice.plans" :key="i"><span class="oa-idx">{{ i + 1 }}</span>{{ p }}</div>
+            </div>
+            <div class="oa-bt" v-if="ob">
+              <span class="oa-bt-label">开盘策略回测 · 近 {{ ob.days }} 日</span>
+              <span class="tag">建议买入 {{ ob.filtered.win_rate }}%（{{ ob.filtered.samples }} 次 · 均 {{ ob.filtered.avg_return }}%）</span>
+              <span class="tag" v-if="ob.support_only">仅竞价低吸 {{ ob.support_only.win_rate }}%（{{ ob.support_only.samples }} 次）</span>
+              <span class="tag">全部开盘买 {{ ob.baseline.win_rate }}%（{{ ob.baseline.samples }} 次）</span>
+              <span class="tag">观望/回避 {{ ob.avoid.win_rate }}%（{{ ob.avoid.samples }} 次）</span>
+              <span class="muted small" v-if="ob.excluded_limit_days">已剔除 {{ ob.excluded_limit_days }} 个连板日</span>
+              <button class="ghost-btn" :disabled="obLoading" @click="loadOb(true)">{{ obLoading ? '回测中…' : '重算' }}</button>
+            </div>
+            <div class="muted small" v-else-if="obLoading">正在回测开盘策略（近 20 个交易日）…</div>
+            <div class="error-bar" v-if="obError">{{ obError }}</div>
+            <div class="muted small">{{ advice.note }}</div>
+          </div>
+
           <div class="card chart-card">
             <div class="card-head">
               <div class="card-title">{{ isIntraday ? "分时走势 · 成交量 · MACD · 做T点位" : "K 线 · 均线 · 指标" }}</div>
               <div class="card-sub num" v-if="meta.price">
                 {{ fmtPrice(meta.price) }} <span :class="tone(meta.change_pct)">{{ fmtPct(meta.change_pct) }}</span>
+                <span class="muted" v-if="isIntraday"> · 30s 自动刷新</span>
               </div>
             </div>
             <Chart :option="chartOption" height="430" />
@@ -180,19 +399,194 @@ export default {
               <span class="muted small">均价线回归 / 零轴支撑压力 / MACD 背离 / 量价背离，同向共振信号优先</span>
             </div>
             <div class="t-sum">{{ intra.summary }}</div>
+
+            <div class="t-env" v-if="tEnv">
+              <div class="t-env-item">
+                <span class="t-env-label">指数环境</span>
+                <span class="num" :class="tone(tEnv.index.change_pct)">{{ fmtPct(tEnv.index.change_pct) }}</span>
+                <span class="t-env-badge">{{ tEnv.index.label }}</span>
+              </div>
+              <div class="t-env-item">
+                <span class="t-env-label">板块环境</span>
+                <span v-if="tEnv.sector.matched" class="num" :class="tone(tEnv.sector.change_pct)">{{ fmtPct(tEnv.sector.change_pct) }}</span>
+                <span v-else class="num muted">无代理</span>
+                <span class="t-env-badge">{{ tEnv.sector.matched ? tEnv.sector.name + ' · ' + tEnv.sector.etf : tEnv.sector.label }}</span>
+              </div>
+              <div class="t-env-item">
+                <span class="t-env-label">个股相对</span>
+                <span class="num" :class="tone(tEnv.relative)">{{ fmtNumber(tEnv.relative, 2) }}</span>
+                <span class="t-env-badge">{{ tEnv.relative >= 0.15 ? '强于板块' : (tEnv.relative <= -0.15 ? '弱于板块' : '与板块同步') }}</span>
+              </div>
+              <div class="t-env-item" :class="tEnv.score >= 0.35 ? 'up' : (tEnv.score <= -0.35 ? 'down' : '')">
+                <span class="t-env-label">综合环境</span>
+                <span class="num" :class="tone(tEnv.score)">{{ fmtNumber(tEnv.score, 2) }}</span>
+                <span class="t-env-badge">{{ tEnv.label }}</span>
+              </div>
+              <div class="t-env-item" v-if="tEnv.dk">
+                <span class="t-env-label">日K 背景</span>
+                <span class="num" :class="tone(tEnv.dk.score)">{{ fmtNumber(tEnv.dk.score, 2) }}</span>
+                <span class="t-env-badge">{{ tEnv.dk.label }} · {{ tEnv.dk.align }}</span>
+              </div>
+              <div class="t-env-item" v-if="tEnv.mkt">
+                <span class="t-env-label">大盘环境</span>
+                <span class="num" :class="tone(tEnv.mkt.score)">{{ fmtNumber(tEnv.mkt.score, 2) }}</span>
+                <span class="t-env-badge">情绪 {{ tEnv.mkt.sent.score }} {{ tEnv.mkt.sent.label }} · {{ tEnv.mkt.forecast.pattern }}</span>
+              </div>
+            </div>
+            <div class="t-env-note" v-if="tEnv">
+              {{ tEnv.note }}
+              <span v-if="tEnv.aligned_up && tEnv.score < 0.5"> · 做T买点强度上调 {{ tEnv.buy_boost + 6 }} 分</span>
+              <span v-else-if="tEnv.score >= 0.5"> · 指数/板块偏热，买点降级避免追高</span>
+              <span v-else-if="tEnv.score <= -0.5"> · 共振走弱，买点降级、目标收窄至 0.3%</span>
+              <span v-if="tEnv.dk"> · 日K {{ tEnv.dk.label }}，空头排列时买点降 10 分</span>
+            </div>
+
+            <div class="t-limit" v-if="intra.limit && intra.limit.limit_up_today">
+              <span class="tag" :class="intra.limit.distorted ? 'cold' : 'hot'">{{ intra.limit.label }}</span>
+              <span class="muted small">{{ intra.limit.distorted ? '连板/封板导致分时指标失真，已暂停做T点位' : '首板涨停当日封板后波动有限，做T点位仅供参考' }}</span>
+            </div>
+
             <div class="t-list" v-if="tPoints.length">
               <span v-for="p in tPoints.slice(0, 8)" :key="p.time + p.type + p.strategy" class="tag" :class="p.type === 'buy' ? 'hot' : 'cold'">
                 {{ p.time }} {{ p.type === 'buy' ? 'T买' : 'T卖' }} {{ p.price }}
                 <em class="t-tag">{{ p.strategy }}</em>
+                <template v-if="p.grade"><em class="t-strength" :class="p.grade === '强' ? 'up' : (p.grade === '弱' ? 'down' : '')">{{ p.grade }}{{ p.strength }}</em></template>
                 <template v-if="p.deviation !== null && p.deviation !== undefined">（{{ fmtPct(p.deviation) }}）</template>
               </span>
             </div>
             <div class="t-stats">
               <span class="tag" v-for="s in tStrategies" :key="s.name" :title="s.note">
-                {{ s.name }} · 胜率 {{ s.win_rate }}%（{{ s.samples }} 次）
+                {{ s.name }} · 目标 {{ s.target }}% / 止损 {{ s.stop }}%
               </span>
             </div>
-            <div class="muted small">回测为 10 只样本股近 5 个交易日的 5 分钟线统计，未计手续费，不构成收益承诺。</div>
+
+            <div class="t-bt">
+              <div class="t-bt-head">
+                <span class="tag hot">环境过滤回测</span>
+                <span class="muted small" v-if="bt">近 {{ bt.days }} 个交易日 · 5 分钟线 · 已剔除 {{ bt.excluded_limit_days }} 个连板/涨停日 · {{ bt.updated_at }}</span>
+                <span class="muted small" v-else-if="btLoading">正在回测近 10 个交易日的 5 分钟线…</span>
+                <button class="ghost-btn" v-if="bt" :disabled="btLoading" @click="loadBt(true)">{{ btLoading ? '重算中…' : '重算' }}</button>
+              </div>
+              <div class="error-bar" v-if="btError">{{ btError }}</div>
+              <template v-if="bt">
+                <div class="t-bt-body">
+                  <div class="t-bt-cell">
+                    <div class="vp-label">基准胜率（全部信号）</div>
+                    <div class="t-bt-value num">{{ bt.baseline.win_rate }}%</div>
+                    <div class="muted small">{{ bt.baseline.samples }} 次 · 平均 {{ bt.baseline.avg_return }}%</div>
+                  </div>
+                  <div class="t-bt-arrow">→</div>
+                  <div class="t-bt-cell">
+                    <div class="vp-label">叠加指数/板块环境后</div>
+                    <div class="t-bt-value num up">{{ bt.env_filtered.win_rate }}%</div>
+                    <div class="muted small">{{ bt.env_filtered.samples }} 次 · 平均 {{ bt.env_filtered.avg_return }}%</div>
+                  </div>
+                  <div class="t-bt-arrow">→</div>
+                  <div class="t-bt-cell">
+                    <div class="vp-label">强共振信号（板块向上+个股同步 或 强度≥70）</div>
+                    <div class="t-bt-value num up">{{ bt.strong.win_rate }}%</div>
+                    <div class="muted small">{{ bt.strong.samples }} 次 · 平均 {{ bt.strong.avg_return }}%</div>
+                  </div>
+                </div>
+                <div class="t-bt-strategy" v-if="bt.buy_env">
+                  <span class="tag">环境过滤后买点 {{ bt.buy_env.win_rate }}%（{{ bt.buy_env.samples }} 次）</span>
+                  <span class="tag">环境过滤后卖点 {{ bt.sell_env.win_rate }}%（{{ bt.sell_env.samples }} 次）</span>
+                </div>
+                <div class="t-bt-strategy" v-if="bt.by_strategy && bt.by_strategy.length">
+                  <span class="tag" v-for="s in bt.by_strategy" :key="s.name">
+                    {{ s.name }}：基准 {{ s.win_rate }}%（{{ s.samples }}）→ 环境 {{ s.env_win_rate === null ? '-' : s.env_win_rate + '%' }}（{{ s.env_samples }}）
+                  </span>
+                </div>
+                <div class="muted small">{{ bt.note }} 回测未计手续费与滑点，不构成收益承诺。</div>
+              </template>
+            </div>
+          </div>
+
+          <div class="card plan-card" v-if="strategy">
+            <div class="card-head">
+              <div>
+                <div class="card-title">明日预期与应对策略</div>
+                <div class="card-sub">
+                  八指标 + 价值分析
+                  <template v-if="analysis"> · {{ analysis.label }}快照 {{ analysis.computed_at }} 更新（{{ analysis.next_update }} 重算）</template>
+                </div>
+              </div>
+              <span class="verdict-badge" :class="strategy.tomorrow.tone">{{ strategy.tomorrow.bias }}</span>
+            </div>
+
+            <div class="plan-top">
+              <div>
+                <div class="vp-label">明日预期区间</div>
+                <div class="plan-range num">{{ fmtPrice(strategy.tomorrow.range.low) }} ~ {{ fmtPrice(strategy.tomorrow.range.high) }}</div>
+                <div class="muted small">按近 20 日日均振幅 {{ strategy.tomorrow.amplitude }}% 估算 · 信心 {{ strategy.tomorrow.confidence }}</div>
+              </div>
+              <div class="verdict-points plan-levels">
+                <div class="vp">
+                  <div class="vp-label">明日参考支撑</div>
+                  <div class="vp-value num down">{{ fmtPrice(strategy.tomorrow.support) }}</div>
+                </div>
+                <div class="vp">
+                  <div class="vp-label">明日参考压力</div>
+                  <div class="vp-value num up">{{ fmtPrice(strategy.tomorrow.resistance) }}</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="advice" v-if="strategy.tomorrow.expectation">{{ strategy.tomorrow.expectation }}</div>
+
+            <div class="plan-scenarios">
+              <div class="ps-row" v-for="s in strategy.tomorrow.scenarios" :key="s.name">
+                <span class="ps-name">{{ s.name }}</span>
+                <span class="tag num">{{ s.prob }}%</span>
+                <span class="ps-trigger">{{ s.trigger }}</span>
+                <span class="ps-plan">{{ s.plan }}</span>
+              </div>
+            </div>
+
+            <div class="plan-watch">
+              <span class="eyebrow">明日盯盘</span>
+              <span class="tag" v-for="w in strategy.tomorrow.watch" :key="w">{{ w }}</span>
+            </div>
+
+            <div class="plan-grid">
+              <div class="plan-col">
+                <div class="plan-head">
+                  <span>短期 · {{ strategy.short_term.horizon }}</span>
+                  <span class="tag gold">{{ strategy.short_term.stance }}</span>
+                </div>
+                <ul class="plan-list"><li v-for="a in strategy.short_term.actions" :key="a">{{ a }}</li></ul>
+                <div class="muted small">{{ strategy.short_term.guard }}</div>
+              </div>
+              <div class="plan-col">
+                <div class="plan-head">
+                  <span>中期 · {{ strategy.mid_term.horizon }}</span>
+                  <span class="tag">{{ strategy.mid_term.stance }}</span>
+                </div>
+                <ul class="plan-list"><li v-for="a in strategy.mid_term.actions" :key="a">{{ a }}</li></ul>
+                <div class="muted small">{{ strategy.mid_term.guard }}</div>
+              </div>
+            </div>
+
+            <div class="plan-basis muted small">
+              指标依据：{{ strategy.basis.indicator }} · 价值依据：{{ strategy.basis.valuation }}
+            </div>
+
+            <details class="plan-details" v-if="strategy.details && strategy.details.sections" ref="detailsEl">
+              <summary>展开指标依据与计算逻辑</summary>
+              <div class="pd-sec" v-for="s in strategy.details.sections" :key="s.title">
+                <div class="pd-title">{{ s.title }}</div>
+                <div class="pd-note muted small" v-if="s.note">{{ s.note }}</div>
+                <div class="pd-row" v-for="it in s.items" :key="it.label">
+                  <span class="pd-label">{{ it.label }}</span>
+                  <span class="pd-value num">{{ it.value }}</span>
+                  <span class="pd-hint">{{ it.hint }}</span>
+                </div>
+                <div class="pd-formula" v-if="s.formula">算法：{{ s.formula }}</div>
+              </div>
+              <div class="pd-foot">
+                <button type="button" class="chip" @click="closeDetails">收起</button>
+              </div>
+            </details>
           </div>
 
           <div class="analyze-grid">
@@ -214,14 +608,14 @@ export default {
                   <MiniCandle :bars="b.bars || []" :prev-close="b.prev_close" :height="46" />
                   <div class="board-meta">
                     <span class="tag">{{ b.state }}</span>
-                    <span class="num muted small">5日 {{ fmtPct(b.change_5d) }}</span>
-                    <span class="num muted small">20日 {{ fmtPct(b.change_20d) }}</span>
+                    <span class="num small" :class="tone(b.change_5d)">5日 {{ fmtPct(b.change_5d) }}</span>
+                    <span class="num small" :class="tone(b.change_20d)">20日 {{ fmtPct(b.change_20d) }}</span>
                     <span class="tag" v-if="b.relative !== null && b.relative !== undefined" :class="tone(b.relative)">
                       超额 {{ fmtPct(b.relative) }}
                     </span>
                   </div>
                   <div class="board-meta" v-if="b.today_low_pct !== null && b.today_low_pct !== undefined">
-                    <span class="num muted small">日内 {{ fmtPct(b.today_low_pct) }} ~ {{ fmtPct(b.today_high_pct) }}</span>
+                    <span class="num small">日内 <span :class="tone(b.today_low_pct)">{{ fmtPct(b.today_low_pct) }}</span> ~ <span :class="tone(b.today_high_pct)">{{ fmtPct(b.today_high_pct) }}</span></span>
                     <span class="muted small" v-if="b.up !== null && b.up !== undefined">涨跌家数 {{ b.up }}/{{ b.down }}</span>
                   </div>
                   <div class="board-peers" v-if="b.peers && b.peers.length">
@@ -236,7 +630,7 @@ export default {
                 <div class="col-sub">板块龙头 · {{ ctx.leader.name }}（{{ ctx.leader.code }}）</div>
                 <div class="muted small">
                   今日 <span :class="tone(ctx.leader.change_pct)">{{ fmtPct(ctx.leader.change_pct) }}</span>
-                  · 近 5 日 {{ fmtPct(ctx.leader.change_5d) }}
+                  · 近 5 日 <span :class="tone(ctx.leader.change_5d)">{{ fmtPct(ctx.leader.change_5d) }}</span>
                   <template v-if="ctx.relative && ctx.relative.to_leader !== null && ctx.relative.to_leader !== undefined">
                     · 个股相对龙头超额 <span :class="tone(ctx.relative.to_leader)">{{ fmtPct(ctx.relative.to_leader) }}</span>
                   </template>
@@ -402,17 +796,38 @@ export default {
 
           <div class="card ind-card" v-if="ind">
             <div class="card-head">
-              <div class="card-title">六指标综合研判</div>
+              <div class="card-title">八指标综合研判</div>
               <div class="card-sub" :class="tone(ind.score)">{{ ind.direction }} · {{ ind.score }} 分</div>
+              <div class="right ind-tools">
+                <span class="muted small" v-if="!indLocked">拖拽卡片可调整顺序</span>
+                <button type="button" class="chip-btn" :class="{ gold: indLocked }" @click="toggleIndLock">
+                  {{ indLocked ? '已锁定' : '锁定排序' }}
+                </button>
+                <button type="button" class="chip-btn" v-if="indOrder.length" @click="resetIndOrder">恢复默认</button>
+              </div>
             </div>
             <div class="ind-grid">
-              <div class="ind-cell" v-for="item in ind.votes" :key="item.key">
-                <div class="tech-k">{{ item.title }}</div>
+              <div class="ind-cell" v-for="item in orderedVotes" :key="item.key"
+                   :class="{ dragging: dragKey === item.key, 'drag-over': dragOverKey === item.key, locked: indLocked }"
+                   :draggable="!indLocked"
+                   @dragstart="onIndDragStart(item, $event)"
+                   @dragover.prevent="dragOverKey = item.key"
+                   @dragleave="dragOverKey = dragOverKey === item.key ? null : dragOverKey"
+                   @drop.prevent="onIndDrop(item)"
+                   @dragend="onIndDragEnd">
+                <div class="ind-cell-head">
+                  <div class="tech-k">{{ item.title }}</div>
+                  <span class="ind-handle" v-if="!indLocked" title="拖拽排序">⋮⋮</span>
+                  <span class="ind-lock-icon" v-else title="排序已锁定">锁</span>
+                </div>
                 <div class="tech-v" :class="item.vote > 0 ? 'up' : item.vote < 0 ? 'down' : 'flat'">{{ item.value }}</div>
                 <div class="muted small">{{ item.desc }}</div>
               </div>
             </div>
             <div class="ind-tip muted small">{{ ind.tomorrow.expectation }}</div>
+            <div class="muted small" v-if="analysis" style="margin-top:6px">
+              {{ analysis.label }}快照 · {{ analysis.computed_at }} 更新 · 下一次 {{ analysis.next_update }} 重算
+            </div>
           </div>
 
           <div class="card news-card">

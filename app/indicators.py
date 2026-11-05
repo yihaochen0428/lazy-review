@@ -1,4 +1,4 @@
-"""技术指标计算：MA / MACD / KDJ / RSI / 斐波那契 / 简化波浪"""
+"""技术指标计算：MA / MACD / KDJ / RSI / 布林带 / 斐波那契 / 简化波浪"""
 
 
 def ma(values, n):
@@ -70,6 +70,25 @@ def rsi(closes, n=14):
         avg_gain = (avg_gain * (n - 1) + max(diff, 0)) / n
         avg_loss = (avg_loss * (n - 1) + max(-diff, 0)) / n
         out[i] = round(100.0 if avg_loss == 0 else 100 - 100 / (1 + avg_gain / avg_loss), 2)
+    return out
+
+
+def bollinger(closes, n=20, k=2.0):
+    """布林带：中轨 = n 日收盘均值，上下轨 = 中轨 ± k 倍总体标准差"""
+    out = []
+    for i in range(len(closes)):
+        if i < n - 1:
+            out.append(None)
+            continue
+        window = closes[i - n + 1:i + 1]
+        mid = sum(window) / n
+        std = (sum((v - mid) ** 2 for v in window) / n) ** 0.5
+        out.append({
+            "mid": round(mid, 2),
+            "upper": round(mid + k * std, 2),
+            "lower": round(mid - k * std, 2),
+            "width": round(2 * k * std / mid * 100, 2) if mid else None,
+        })
     return out
 
 

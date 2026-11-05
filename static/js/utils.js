@@ -37,6 +37,14 @@ export function tone(value) {
   return value > 0 ? "up" : value < 0 ? "down" : "flat";
 }
 
+/** A股连续竞价时段（09:15-11:30 / 13:00-15:05），用于决定是否轮询分时行情 */
+export function isMarketOpen(now = new Date()) {
+  const day = now.getDay();
+  if (day === 0 || day === 6) return false;
+  const minutes = now.getHours() * 60 + now.getMinutes();
+  return (minutes >= 555 && minutes <= 690) || (minutes >= 780 && minutes <= 905);
+}
+
 export function shortName(name, max = 5) {
   if (!name) return "-";
   const trimmed = name.replace(/\s+/g, "");
@@ -70,10 +78,13 @@ export function areaPath(values, width = 96, height = 26, pad = 2) {
 }
 
 // 分时涨跌幅序列 → 0轴对称的红绿分段 SVG path（水上红 / 水下绿，穿越补点防断线）
-export function intraPath(pct, width = 96, height = 26, pad = 2) {
+// total 为全交易日 5 分钟线根数（上午 24 + 下午 24），用于按真实时段占位，
+// 未交易时段自然留白，避免把半日数据拉伸铺满整幅
+export function intraPath(pct, width = 96, height = 26, pad = 2, total = 48) {
   if (!pct || pct.length < 2) return null;
   const max = Math.max(...pct.map((v) => Math.abs(v)), 0.2);
-  const step = (width - pad * 2) / (pct.length - 1);
+  const span = Math.max(total - 1, pct.length - 1, 1);
+  const step = (width - pad * 2) / span;
   const yOf = (v) => height / 2 - (v / max) * (height / 2 - pad);
   const pts = pct.map((v, i) => [pad + i * step, yOf(v)]);
   const upSeg = [];

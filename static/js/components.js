@@ -8,7 +8,8 @@ export const Chart = {
     height: { type: String, default: "460px" },
     tall: { type: Boolean, default: false },
   },
-  template: `<div ref="el" class="chart-box" :class="{tall}" :style="{height: tall ? '540px' : height}"></div>`,
+  // tall 模式的尺寸交给 CSS（.chart-box.tall），便于移动端媒体查询降高；显式 height 才写内联
+  template: `<div ref="el" class="chart-box" :class="{tall}" :style="tall ? null : { height }"></div>`,
   mounted() {
     this.chart = window.echarts.init(this.$refs.el, null, { renderer: "canvas" });
     this.chart.setOption(this.option, true);

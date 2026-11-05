@@ -9,7 +9,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 from .db import cached_call
-from .config import QUOTE_TTL, KLINE_TTL, CONCEPT_TTL
+from .config import QUOTE_TTL, KLINE_TTL, CONCEPT_TTL, is_trading_time
 
 # 对数据源友好：全局最多 4 个并发，请求之间保持最小间隔
 _SEMAPHORE = threading.Semaphore(4)
@@ -59,6 +59,8 @@ SINA_CONCEPT = "https://vip.stock.finance.sina.com.cn/q/view/newFLJK.php?param=c
 SINA_TOP = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
             "Market_Center.getHQNodeData?page=1&num=100&sort=changepercent&asc=0&node=hs_a"
             "&symbol=&_s_r_a=page")
+SINA_FLOW = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+             "MoneyFlow.ssl_qsfx_zjlrqs?page=1&num=1&sort=opendate&asc=0&daima={symbol}")
 
 QUOTE = "https://push2.eastmoney.com/api/qt"
 POOL = "https://push2ex.eastmoney.com"
@@ -95,8 +97,8 @@ def _pace():
         _LAST_REQUEST[0] = time.time()
 
 
-def _get_json(url: str, timeout: int = 15, retries: int = 3):
-    if _is_down():
+def _get_json(url: str, timeout: int = 15, retries: int = 3, guard: bool = True, mark: bool = True):
+    if guard and _is_down():
         raise DataError("东方财富接口熔断中")
     last = None
     for attempt in range(retries + 1):
@@ -109,7 +111,8 @@ def _get_json(url: str, timeout: int = 15, retries: int = 3):
         except Exception as exc:  # noqa: BLE001
             last = exc
             time.sleep(0.6 * (attempt + 1) + random.uniform(0, 0.3))
-    _mark_down()
+    if mark:
+        _mark_down()
     raise DataError(f"请求失败: {last}")
 
 
@@ -147,6 +150,30 @@ def tencent_symbol(code: str) -> str:
     if code.startswith("920") or code.startswith("8") or code.startswith("4"):
         return f"bj{code}"
     return ("sh" if code[:1] in ("6", "9") else "sz") + code
+
+
+def _sina_money_flow(code: str):
+    """新浪资金流向兜底（东财 push2 不可用时的主力净额）：失败返回 {}，避免重复请求"""
+    def producer():
+        try:
+            rows = json.loads(_get_sina(SINA_FLOW.format(symbol=tencent_symbol(code)))
+                              .replace("\n", ""))
+        except Exception:  # noqa: BLE001
+            return {}
+        if not isinstance(rows, list) or not rows:
+            return {}
+        row = rows[0]
+        net = num(row.get("netamount"))
+        ratio = num(row.get("ratioamount"))
+        if net is None:
+            return {}
+        return {"main_flow": net,
+                "main_flow_pct": round(ratio * 100, 2) if ratio is not None else None}
+
+    try:
+        return cached_call(f"sinaflow:{code}", 60 if is_trading_time() else QUOTE_TTL, producer) or {}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _tencent_quotes(symbols):
@@ -442,6 +469,211 @@ def _fetch_breadth_sina():
         down = 0
     flat = max(total - up - down, 0)
     return {"up": up, "down": down, "flat": flat, "total": total}
+
+
+# ---------------------------------------------------------------- 市场概况（涨跌分布 / 主力净流入）
+DIST_TTL = 180
+
+
+def fetch_distribution():
+    """全市场涨跌幅分布：在降序列表上二分定位 5% / 1% / -1% / -5% 分界
+
+    返回各阈值以上的家数，供前端画「涨停—跌停」9 档柱状图。
+    """
+    return cached_call("dist:v2", DIST_TTL, _fetch_distribution_raw)
+
+
+def _fetch_distribution_raw():
+    try:
+        return _fetch_distribution_sina()
+    except DataError:
+        return _fetch_distribution_eastmoney()
+
+
+def _fetch_distribution_sina():
+    total = int(num(_get_sina(SINA_COUNT).strip().strip('"'), 0) or 0)
+    if not total:
+        raise DataError("备用涨跌分布数据为空")
+    pages = math.ceil(total / 100)
+    cache = {}
+
+    def page_rows(pn):
+        if pn not in cache:
+            rows = []
+            for _ in range(3):
+                try:
+                    rows = json.loads(_get_sina(SINA_LIST.format(page=pn)) or "[]")
+                except ValueError:
+                    rows = []
+                if isinstance(rows, list) and rows:
+                    break
+            cache[pn] = rows if isinstance(rows, list) else []
+        return cache[pn]
+
+    def pct(row):
+        return num(row.get("changepercent"), 0) or 0
+
+    def count_ge(threshold):
+        """涨跌幅降序：定位「整页末行已低于阈值」的首个分界页，再在页内精确统计"""
+        lo, hi, cross = 1, pages, None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            rows = page_rows(mid)
+            if not rows:  # 分页没取到就不要误判成「全部高于阈值」
+                raise DataError(f"涨跌分布分页读取失败（第 {mid} 页）")
+            if pct(rows[-1]) < threshold:
+                cross = mid
+                hi = mid - 1
+            else:
+                lo = mid + 1
+        if cross is None:
+            return total
+        rows = page_rows(cross)
+        if not rows:
+            raise DataError(f"涨跌分布分页读取失败（第 {cross} 页）")
+        counted = (cross - 1) * 100 + sum(1 for r in rows if pct(r) >= threshold)
+        return min(max(counted, 0), total)
+
+    return {
+        "source": "sina",
+        "total": total,
+        "ge5": count_ge(5),
+        "ge1": count_ge(1),
+        "ge_neg1": count_ge(-1),
+        "ge_neg5": count_ge(-5),
+    }
+
+
+def _fetch_distribution_eastmoney():
+    cache = {}
+    first = _breadth_page(1, cache)
+    total = int(first.get("total") or 0)
+    if not total:
+        raise DataError("全市场行情为空")
+    pages = math.ceil(total / 100)
+
+    def count_ge(threshold):
+        def page_below(pn):
+            diff = _breadth_page(pn, cache).get("diff") or []
+            return bool(diff) and (num(diff[-1].get("f3"), 0) or 0) < threshold
+
+        lo, hi, cross = 1, pages, None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if page_below(mid):
+                cross = mid
+                hi = mid - 1
+            else:
+                lo = mid + 1
+        if cross is None:
+            return total
+        diff = _breadth_page(cross, cache).get("diff") or []
+        return min((cross - 1) * 100 + sum(1 for r in diff if (num(r.get("f3"), 0) or 0) >= threshold), total)
+
+    return {
+        "source": "eastmoney",
+        "total": total,
+        "ge5": count_ge(5),
+        "ge1": count_ge(1),
+        "ge_neg1": count_ge(-1),
+        "ge_neg5": count_ge(-5),
+    }
+
+
+def fetch_market_flow():
+    """沪深两市主力净流入（亿元）：push2his 大盘资金流接口按日累计"""
+    return cached_call("mkt:flow:v2", 120, _fetch_market_flow_raw)
+
+
+def _fetch_market_flow_raw():
+    total = 0.0
+    ok = False
+    for secid in ("1.000001", "0.399001"):
+        url = ("https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+               f"?secid={secid}&fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56"
+               f"&klt=101&lmt=1&ut={UT_QUOTE}")
+        try:
+            data = _get_json(url, retries=0).get("data") or {}
+        except DataError:
+            break
+        klines = data.get("klines") or []
+        if not klines:
+            continue
+        parts = str(klines[-1]).split(",")
+        if len(parts) > 1:
+            total += num(parts[1], 0) or 0
+            ok = True
+    if ok:
+        return round(total / 1e8, 2)
+    # push2his 被限流时走数据中心报表（沪深两市 AB 股主力净流入，单位万元）
+    flt = urllib.parse.quote('(PLATE="沪深两市")(BONDTYPE="AB股")')
+    url = ("https://datacenter-web.eastmoney.com/api/data/v1/get"
+           "?reportName=RPT_MARKET_CAPITALFLOW&columns=PLATE,BONDTYPE,TRADE_DATE,NET_INFLOW"
+           "&pageNumber=1&pageSize=3&sortColumns=TRADE_DATE&sortTypes=-1&filter=" + flt)
+    data = _get_json(url, retries=1, guard=False, mark=False)
+    rows = (data.get("result") or {}).get("data") or []
+    if not rows:
+        raise DataError("主力净流入数据为空")
+    return round((num(rows[0].get("NET_INFLOW"), 0) or 0) / 1e4, 2)
+
+
+# ---------------------------------------------------------------- 同花顺日线（成交额备用源）
+THS_LINE = "https://d.10jqka.com.cn/v6/line/{code}/01/{kind}.js"
+THS_INDEX = ("hs_1A0001", "hs_399001")  # 上证指数 / 深证成指
+
+
+def _ths_payload(code, kind):
+    url = THS_LINE.format(code=code, kind=kind)
+    raw = _get_text(url, timeout=12, retries=2, encoding="utf-8")
+    start, end = raw.find("("), raw.rfind(")")
+    if start < 0 or end <= start:
+        raise DataError("同花顺返回格式异常")
+    try:
+        payload = json.loads(raw[start + 1:end])
+    except ValueError as exc:
+        raise DataError(f"同花顺数据解析失败: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise DataError("同花顺返回结构异常")
+    # today.js 外层带股票代码键，last.js 直接返回数据本体
+    return (payload.get(code) or {}) if code in payload else payload
+
+
+def fetch_ths_amounts():
+    """同花顺日线口径的沪深两市成交额（亿元），东财不可用时的备用源"""
+    def producer():
+        sums = {}
+        ok = 0
+        for code in THS_INDEX:
+            days = {}
+            try:
+                payload = _ths_payload(code, "last")
+            except DataError:
+                payload = {}
+            for record in str(payload.get("data") or "").split(";"):
+                parts = record.split(",")
+                if len(parts) < 7:
+                    continue
+                date, amount = parts[0], num(parts[6], 0) or 0
+                if len(date) == 8 and amount:
+                    days[f"{date[:4]}-{date[4:6]}-{date[6:]}"] = amount
+            try:
+                today = _ths_payload(code, "today")
+            except DataError:
+                today = {}
+            date = str(today.get("1") or "")
+            amount = num(today.get("19"), 0) or 0
+            if len(date) == 8 and amount:
+                days[f"{date[:4]}-{date[4:6]}-{date[6:]}"] = amount
+            if len(days) < 20:  # 该市场没取到历史，视为失败
+                continue
+            ok += 1
+            for d, v in days.items():
+                sums[d] = sums.get(d, 0) + v
+        if ok < len(THS_INDEX):
+            raise DataError("同花顺成交额数据不完整")
+        return {k: round(v / 1e8, 2) for k, v in sums.items()}
+
+    return cached_call("ov:amount:ths:v3", 300, producer) or {}
 
 
 # ---------------------------------------------------------------- 涨停/跌停/炸板池
@@ -770,7 +1002,8 @@ def fetch_minute_kline(secid: str, scale: int = 5, limit: int = 240, days: int =
             base = row["close"]
         return {"bars": bars, "prev_close": prev_close, "days": keep}
 
-    return cached_call(cache_key, 120, producer)
+    # 盘中分时每 30 秒取一次新数据，收盘后延长缓存，避免无意义的重复请求
+    return cached_call(cache_key, 30 if is_trading_time() else 300, producer)
 
 
 # ---------------------------------------------------------------- 财务与行业（F10）
@@ -1022,7 +1255,8 @@ def fetch_stock_meta(code: str):
             "amplitude": num(data.get("f171")),
         }
 
-    return cached_call(f"meta:{code}", QUOTE_TTL, producer)
+    # 盘中快照 30 秒过期，收盘后沿用较长缓存
+    return cached_call(f"meta:{code}", 30 if is_trading_time() else QUOTE_TTL, producer)
 
 
 def _tencent_stock_meta(code: str):
@@ -1229,4 +1463,29 @@ def fetch_quotes(codes):
                 }
         except DataError:
             pass
+    # 东财 f62 缺失（接口熔断或返回 "-"）时，用新浪资金流向补齐主力净额
+    missing = [c for c in codes if not (out.get(c) or {}).get("main_flow")]
+    if missing:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for code, flow in zip(missing, pool.map(_sina_money_flow, missing)):
+                if flow and code in out:
+                    out[code]["main_flow"] = flow.get("main_flow")
+                    out[code]["main_flow_pct"] = flow.get("main_flow_pct")
+    return out
+
+
+def fetch_changes(codes):
+    """只取最新涨跌幅（腾讯批量）：用于异动监控等列表补充当日涨跌，避免逐只拉资金流"""
+    codes = [c for c in codes if c]
+    out = {}
+    for start in range(0, len(codes), 40):
+        chunk = codes[start:start + 40]
+        try:
+            quotes = _tencent_quotes([tencent_symbol(c) for c in chunk])
+        except DataError:
+            continue
+        for code in chunk:
+            fields = quotes.get(tencent_symbol(code))
+            if fields:
+                out[code] = num(fields[32])
     return out

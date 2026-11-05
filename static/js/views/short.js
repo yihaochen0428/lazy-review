@@ -146,13 +146,14 @@ export default {
             <div class="table-wrap" v-if="g.items.length">
               <table class="simple compact">
                 <thead>
-                  <tr><th>个股</th><th>触发日</th><th>区间</th><th>偏离值</th><th>{{ g.key === 'exiting' ? '监管剩余' : '触发需' }}</th></tr>
+                  <tr><th>个股</th><th>触发日</th><th>区间</th><th>今日涨跌</th><th>偏离值</th><th>{{ g.key === 'exiting' ? '监管剩余' : '触发需' }}</th></tr>
                 </thead>
                 <tbody>
                   <tr v-for="s in g.items" :key="s.code" @click="openStock(s.code)" style="cursor:pointer" :title="s.rule">
                     <td class="name-cell">{{ s.name }}<small class="num">{{ s.code }}</small></td>
                     <td class="num muted">{{ (s.date || '').slice(5) }}</td>
                     <td class="num">{{ s.days ? s.days + ' 日' : '-' }}</td>
+                    <td class="num" :class="tone(s.change_pct)"><b>{{ fmtPct(s.change_pct) }}</b></td>
                     <td class="num" :class="tone(s.dev)"><b>{{ fmtPct(s.dev) }}</b></td>
                     <td class="num gold" v-if="g.key === 'exiting'">{{ s.remaining }} 日</td>
                     <td class="num" :class="tone(s.target)" v-else-if="!s.happened">{{ fmtPct(s.target) }}</td>
