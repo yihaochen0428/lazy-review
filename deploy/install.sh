@@ -12,14 +12,32 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-command -v python3 >/dev/null 2>&1 || { echo "缺少 python3，请先安装 Python 3.10+" >&2; exit 1; }
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' || {
-  echo "Python 版本过低：$(python3 -V)，需要 3.10+" >&2
-  exit 1
-}
+PIP_INDEX="${PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple/}"
+
+# 选择 Python：优先 3.12/3.11/3.10，系统自带的 3.6 不够用
+PY_BIN=""
+for candidate in python3.12 python3.11 python3.10 python3; do
+  if command -v "$candidate" >/dev/null 2>&1 \
+     && "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+    PY_BIN="$candidate"
+    break
+  fi
+done
+
+# 阿里云 Linux 3 / RHEL 8 默认只有 Python 3.6，源里带 python3.11
+if [ -z "$PY_BIN" ]; then
+  if command -v dnf >/dev/null 2>&1; then
+    dnf install -y python3.11 python3.11-pip
+  elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update && apt-get install -y python3.11 python3.11-venv
+  fi
+  command -v python3.11 >/dev/null 2>&1 && PY_BIN=python3.11
+fi
+[ -n "$PY_BIN" ] || { echo "需要 Python 3.10+，请先安装" >&2; exit 1; }
+echo "使用 $($PY_BIN -V)"
 
 # 补装 git / venv（Debian 系与 RHEL 系）
-if ! command -v git >/dev/null 2>&1 || ! python3 -m venv --help >/dev/null 2>&1; then
+if ! command -v git >/dev/null 2>&1 || ! "$PY_BIN" -m venv --help >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update && apt-get install -y git python3-venv
   elif command -v dnf >/dev/null 2>&1; then
@@ -46,12 +64,14 @@ else
 fi
 
 # 依赖
-python3 -m venv "$APP_DIR/.venv"
-"$APP_DIR/.venv/bin/pip" install --upgrade pip
-"$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"
+"$PY_BIN" -m venv "$APP_DIR/.venv"
+"$APP_DIR/.venv/bin/pip" install --upgrade pip -i "$PIP_INDEX"
+"$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt" -i "$PIP_INDEX"
 
+# 代码保持 root 所有（方便 git pull 更新），只有 data/ 交给运行账号
 mkdir -p "$APP_DIR/data"
-chown -R "$SERVICE_USER":"$SERVICE_USER" "$APP_DIR"
+chown -R "$SERVICE_USER":"$SERVICE_USER" "$APP_DIR/data"
+chmod -R a+rX "$APP_DIR"
 
 # 环境变量（大模型 Key 等，可选）
 if [ ! -f /etc/lazy-review.env ]; then
