@@ -1,0 +1,23 @@
+[Unit]
+Description=懒得复盘 A股复盘看板
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lazy
+Group=lazy
+WorkingDirectory=/opt/lazy-review
+Environment=TZ=Asia/Shanghai
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/lazy-review.env
+ExecStart=/opt/lazy-review/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+Restart=always
+RestartSec=5
+# 只允许写数据目录，代码目录保持只读
+ReadWritePaths=/opt/lazy-review/data
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
