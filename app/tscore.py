@@ -162,7 +162,8 @@ def score_point(point, ctx):
       weights       分层权重
       env_score     环境分 [-1, 1]
       energy        个股量能状态（dict）
-      base_hist     该时段过去 20 日均量（可选，用于计算 base_hist 已在 energy 内）
+      open_price    当日开盘价（开盘价纳入做T判断）
+      spike_fade    该股是否早盘冲高回落型（股性）
       prior_wr      股性先验胜率（0-100，可为 None）
       prior_samples 先验样本数
       strategy_weight 该策略在本股历史表现换算的乘数（0.8-1.3）
@@ -196,9 +197,24 @@ def score_point(point, ctx):
         prior_eff = round(50 + (prior_wr - 50) * prior_samples / (prior_samples + 8), 1)
         prior_part = weights["prior"] * (prior_eff - 50) * 1.2
 
-    strength = _clamp(50 + shape + conf_part + env_part + vol_part + prior_part)
+    # 开盘价参照：买点低于开盘价更安全；冲高回落型在开盘上方追买要降权
+    price = p.get("price") or 0
+    open_price = ctx.get("open_price")
+    open_gap = None
+    open_bias = 0.0
+    if open_price and price:
+        open_gap = round((price / open_price - 1) * 100, 2)
+        open_bias = max(-1.0, min(1.0, open_gap / 1.5))
+        if p.get("type") == "buy":
+            open_bias = -open_bias
+            if ctx.get("spike_fade") and open_gap > 0.8:
+                open_bias -= 0.6
+        open_bias = max(-1.4, min(1.4, open_bias))
+
+    strength = _clamp(50 + shape + conf_part + env_part + vol_part + prior_part + open_bias * 2)
     p["strength"] = int(round(strength))
     p["grade"] = "强" if p["strength"] >= 70 else ("中" if p["strength"] >= 50 else "弱")
+    p["open_gap"] = open_gap
     p["env_score"] = round(env_score, 3)
     p["energy"] = label
     p["energy_label"] = ENERGY_LABELS.get(label, "常规")
@@ -213,7 +229,6 @@ def score_point(point, ctx):
 
     base_target = p.get("target") or base_cfg.get("target") or 0.4
     dyn = round(max(0.25, min(1.8, base_target * k)), 2)
-    price = p.get("price") or 0
     p["dyn_target"] = dyn
     p["target"] = dyn
     if price:
@@ -237,3 +252,92 @@ def score_all(points, ctx):
         scored.append(item)
     scored.sort(key=lambda x: (-(x.get("strength") or 0), x.get("index") or 0))
     return scored
+
+
+MAX_BUYS = 2
+BUY_FLOOR = 50          # 低于该强度不给买点建议
+GAP_BASE = 1.5          # 未反弹时，下一次买点需再跌 1.5%
+GAP_EXPAND = 2.0        # 放量下跌时还需再跌 2%（还有下跌空间）
+
+
+def _gap_of(point):
+    return GAP_EXPAND if point.get("energy") == "expanding" else GAP_BASE
+
+
+def make_plan(scored, open_price):
+    """把加权后的信号收敛成「可执行的做T计划」
+
+    规则（按用户口径）：
+    1. 一天最多两次买点，同一时间只给一个加权结论，不再罗列一堆点位；
+    2. 前一个买点之后如果没有反弹，必须再跌 1.5%（放量下跌 2%）才给下一次买点；
+    3. 有卖点信号时用最强卖点做 T 出；没有卖点时不硬凑，用多指标共振（策略目标 ×
+       量能空间 × 共振数）给出预估 T 出价，只画虚线不给文字建议。
+    """
+    buys = sorted((p for p in scored if p.get("type") == "buy"), key=lambda x: x.get("index") or 0)
+    sells = [p for p in scored if p.get("type") == "sell"]
+
+    accepted, gap_note = [], ""
+    for p in buys:
+        if len(accepted) >= MAX_BUYS:
+            break
+        if not accepted:
+            if (p.get("strength") or 0) >= BUY_FLOOR:
+                accepted.append(p)
+            continue
+        last = accepted[-1]
+        gap = _gap_of(p)
+        if p.get("price") and last.get("price") and p["price"] <= last["price"] * (1 - gap / 100):
+            p["gap_from_last"] = round((last["price"] / p["price"] - 1) * 100, 2)
+            accepted.append(p)
+            gap_note = f"较上一个买点再跌 {p['gap_from_last']}%"
+    if not accepted and buys:
+        accepted.append(max(buys, key=lambda x: (x.get("strength") or 0)))
+        gap_note = "没有达标的强买点，只保留最强的一个供参考"
+
+    strong_sells = [p for p in sells if (p.get("strength") or 0) >= BUY_FLOOR]
+    sell = max(strong_sells, key=lambda x: x.get("strength") or 0) if strong_sells else None
+
+    lines = []
+    if sell:
+        lines.append({"price": sell.get("price"), "label": "T出 · 卖点",
+                      "time": sell.get("time"), "kind": "sell"})
+        mode = "sell"
+    else:
+        # 没有卖点：不做复杂的卖点搜索，用多指标共振放大策略目标
+        for i, p in enumerate(accepted):
+            price = p.get("price") or 0
+            if not price:
+                continue
+            conf = max(1, p.get("confluence") or 1)
+            pct = round(min(1.8, (p.get("dyn_target") or 0.4) * (1 + 0.06 * (conf - 1))), 2)
+            lines.append({"price": round(price * (1 + pct / 100), 2),
+                          "label": f"T出{i + 1} 预估（{conf} 指标共振）",
+                          "time": p.get("time"), "kind": "estimate"})
+        mode = "confluence"
+
+    next_buy = None
+    if accepted and len(accepted) < MAX_BUYS:
+        last = accepted[-1]
+        gap = _gap_of(last)
+        next_buy = {"price": round((last.get("price") or 0) * (1 - gap / 100), 2), "gap": gap}
+
+    open_gap = None
+    if open_price and scored:
+        latest = scored[-1].get("price") or 0
+        open_gap = round((latest / open_price - 1) * 100, 2)
+
+    return {
+        "buys": accepted,
+        "max_buys": MAX_BUYS,
+        "buy_count": len(accepted),
+        "sell_signal": sell,
+        "t_out": lines[0] if lines else None,
+        "t_out_lines": lines,
+        "t_out_mode": mode,
+        "next_buy": next_buy,
+        "open": open_price,
+        "open_gap": open_gap,
+        "gap_note": gap_note,
+        "rule": (f"一天最多 {MAX_BUYS} 次买点；未反弹需再跌 {GAP_BASE}%"
+                 f"（放量下跌 {GAP_EXPAND}%）才给下一次"),
+    }

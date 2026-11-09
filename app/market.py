@@ -577,6 +577,7 @@ def advanced_t(code: str, force: bool = False):
             raise em.DataError("分时数据不可用")
         daily = em.fetch_kline(secid, 101, 120)["bars"]
         price = bars[-1].get("close")
+        open_price = bars[0].get("open") or bars[0].get("close")
         tier, weights = tscore.tier_of(meta.get("float_cap"))
         persona_data = {"profile": {"ok": False}, "experience": {"ok": False}, "base_vol": [None] * 8}
         try:
@@ -641,6 +642,8 @@ def advanced_t(code: str, force: bool = False):
                 "env_score": env.get("score") or 0.0,
                 "energy": blended,
                 "bars": bars,
+                "open_price": open_price,
+                "spike_fade": (profile.get("spike_fade_prob") or 0) >= 55,
                 "prior_wr": None,
                 "prior_samples": 0,
                 "strategy_weight": persona.strategy_weight(experience, point.get("strategy_key")),
@@ -654,16 +657,16 @@ def advanced_t(code: str, force: bool = False):
             item["stock_energy"] = stock_e
             scored.append(item)
 
-        # 盘中需要看到全部买卖点：按时间顺序返回，强度作为每行的加权结论
+        # 把信号收敛成可执行计划：一天最多两次买点，T出画在图上
         scored.sort(key=lambda x: x.get("index") or 0)
-        top = scored
-        strong = sum(1 for p in top if p.get("grade") == "强")
-        buys = sum(1 for p in top if p.get("type") == "buy")
+        plan = tscore.make_plan(scored, open_price)
         stock_overall = stock_energy_state(bars, base_vol) or {}
-        summary = ("当前无可加权信号" if not scored else
-                   f"{tier}股 · 共 {len(scored)} 个信号，加权后强信号 {strong} 个"
-                   f"（买 {buys} / 卖 {len(top) - buys}）；"
-                   f"最新量能：个股{stock_overall.get('label_cn') or '常规'}")
+        t_out = plan.get("t_out")
+        summary = (
+            f"{tier}股 · 买点 {plan['buy_count']} 次（当日上限 {plan['max_buys']} 次）；"
+            f"个股量能{stock_overall.get('label_cn') or '常规'}"
+            + (f"；T出参考 {t_out['price']:.2f}" if t_out else "")
+        )
         return {
             "code": code,
             "name": meta.get("name") or code,
@@ -682,19 +685,19 @@ def advanced_t(code: str, force: bool = False):
                 "sector": {"name": sector_name, **(sector_e or {})} if sector_e else None,
                 "index": index_e,
             },
-            "points": top,
+            "plan": plan,
             "signal_count": len(scored),
             "persona": profile,
             "experience": experience,
             "limit": limit,
             "summary": summary,
-            "note": "加权为量能 + 股性先验的置信度评估，目标价为预期空间，不构成收益承诺",
+            "note": "加权为量能 + 股性 + 开盘价的置信度评估，目标价为预期空间，不构成收益承诺",
             "updated_at": datetime.now().strftime("%H:%M:%S"),
         }
 
     if force:
         return cached_call(f"tadv:force:{code}:{stamp}:{time.time()}", 1, producer)
-    return cached_call(f"tadv:v1:{code}:{stamp}", 300, producer)
+    return cached_call(f"tadv:v2:{code}:{stamp}", 300, producer)
 
 
 def stock_energy_state(bars, base_vol):

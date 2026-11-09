@@ -184,7 +184,7 @@ function intradaySlots(scale = 5) {
   return slots;
 }
 
-export function intradayOption(data, indicator = "MACD") {
+export function intradayOption(data, indicator = "MACD", planLines = null, planMarks = null) {
   const intra = data.intraday || {};
   const bars = intra.bars || data.bars || [];
   const barTimes = bars.map((b) => b.time || String(b.date).slice(11, 16));
@@ -241,12 +241,14 @@ export function intradayOption(data, indicator = "MACD") {
   const limitPct = Math.max(1, Math.ceil(Math.max(devMax, vwapMax) * 1.15 * 2) / 2);
 
   // 做T点位：p.index 是 bars 下标，需换算成横轴槽位
-  const tData = points
+  // 有加权计划时只标加权买点（planMarks），不再把原始信号全部铺在图上
+  const markSource = Array.isArray(planMarks) ? planMarks : points;
+  const tData = markSource
     .map((p) => {
       const si = slotIndex.get(barTimes[p.index]);
       if (si === undefined) return null;
       return {
-        value: [si, p.price, p.type === "buy" ? "T买" : "T卖", p.reason || "", p.strategy || ""],
+        value: [si, p.price, p.mark || (p.type === "buy" ? "T买" : "T卖"), p.reason || "", p.strategy || ""],
         label: { position: p.type === "buy" ? "bottom" : "top" },
         itemStyle: {
           color: p.type === "buy" ? GOLD : BLUE,
@@ -282,7 +284,7 @@ export function intradayOption(data, indicator = "MACD") {
     legend: {
       top: 0, left: 4, itemWidth: 10, itemHeight: 6, itemGap: 12,
       textStyle: { color: "#a3adc0", fontSize: 10 },
-      data: ["价格", ...(hasVwap ? ["均价线"] : []), ...(points.length ? ["做T点位"] : [])],
+      data: ["价格", ...(hasVwap ? ["均价线"] : []), ...(tData.length ? ["做T点位"] : [])],
     },
     tooltip: {
       trigger: "axis",
@@ -381,6 +383,19 @@ export function intradayOption(data, indicator = "MACD") {
       ...(hasVwap ? [{
         type: "line", name: "均价线", data: vwapLine, showSymbol: false,
         lineStyle: { color: GOLD, width: 1.1, type: "solid" },
+      }] : []),
+      ...(planLines && planLines.length ? [{
+        type: "line", name: "预估T出", data: [], showSymbol: false,
+        markLine: {
+          silent: true, symbol: "none", animation: false,
+          lineStyle: { color: BLUE, type: "dashed", width: 1.1, opacity: 0.9 },
+          label: {
+            color: BLUE, fontSize: 9, position: "insideEndTop",
+            formatter: (p) => (p && p.name) || "",
+          },
+          data: planLines.map((l) => ({ yAxis: l.price, name: l.label })),
+        },
+        z: 7,
       }] : []),
       ...(points.length ? [{
         type: "scatter", name: "做T点位", data: tData, symbolSize: 9,

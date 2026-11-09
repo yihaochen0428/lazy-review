@@ -75,7 +75,7 @@ export default {
 
     const chartOption = computed(() => {
       if (!data.value) return null;
-      if (isIntraday.value) return intradayOption(data.value, "MACD");
+      if (isIntraday.value) return intradayOption(data.value, "MACD", planLines.value, planMarks.value);
       return klineOption(data.value, indicator.value, {
         fib: data.value.fib,
         chan: chanOn.value ? chan.value : null,
@@ -194,6 +194,17 @@ export default {
     function advTone(grade) {
       return grade === "强" ? "up" : grade === "弱" ? "down" : "";
     }
+    // 预估 T 出：画在分时图上的虚线，不在下方罗列卖出建议
+    const planLines = computed(() => {
+      const plan = adv.value && adv.value.plan;
+      return plan && plan.t_out_lines && plan.t_out_lines.length ? plan.t_out_lines : null;
+    });
+    // 图上只标加权出来的买点；adv 已加载但当天没有买点时，连原始信号一起隐藏
+    const planMarks = computed(() => {
+      const plan = adv.value && adv.value.plan;
+      if (!plan || !plan.buys) return null;
+      return plan.buys.map((p, i) => ({ ...p, type: "buy", mark: `T买${i + 1}` }));
+    });
 
     const bt = ref(null);
     const btLoading = ref(false);
@@ -241,9 +252,10 @@ export default {
       if (timer) window.clearInterval(timer);
     });
 
-    // 首次进入分时页时拉取一次环境过滤回测（服务端缓存 30 分钟）
+    // 点开分时就加载加权计划与股性画像（不做懒加载，避免盘中还要手动点一次）
     watch(isIntraday, (on) => {
       if (on && !bt.value && !btLoading.value) loadBt(false);
+      if (on && !adv.value && !advLoading.value) loadAdv(false);
     }, { immediate: true });
 
     function onMask(event) {
@@ -309,7 +321,7 @@ export default {
       onIndDragStart, onIndDrop, onIndDragEnd, toggleIndLock, resetIndOrder,
       tPoints, financeRows, industryReports, valuationNotes, valDims, tStrategies, chanFuture,
       tEnv, bt, btLoading, btError, loadBt, advice, ob, obLoading, obError, loadOb,
-      adv, advLoading, advError, loadAdv, advEnergy, advTone,
+      adv, advLoading, advError, loadAdv, advEnergy, advTone, planLines, planMarks,
       closeStock, switchPeriod, onMask, openStock, fmtAmount, fmtNumber, fmtPct, fmtPrice, tone,
     };
   },
@@ -441,9 +453,6 @@ export default {
             <div class="t-head">
               <span class="tag hot">做T点位</span>
               <span class="muted small">均价线回归 / 零轴支撑压力 / MACD 背离 / 量价背离，同向共振信号优先</span>
-              <button class="ghost-btn" :disabled="advLoading" @click="adv ? loadAdv(true) : loadAdv(false)">
-                {{ advLoading ? '分析中…' : (adv ? '重算深度分析' : '深度加权分析') }}
-              </button>
             </div>
             <div class="t-sum">{{ intra.summary }}</div>
 
@@ -493,14 +502,17 @@ export default {
               <span class="muted small">{{ intra.limit.distorted ? '连板/封板导致分时指标失真，已暂停做T点位' : '首板涨停当日封板后波动有限，做T点位仅供参考' }}</span>
             </div>
 
-            <div class="t-list" v-if="tPoints.length">
-              <span v-for="p in tPoints.slice(0, 8)" :key="p.time + p.type + p.strategy" class="tag" :class="p.type === 'buy' ? 'hot' : 'cold'">
-                {{ p.time }} {{ p.type === 'buy' ? 'T买' : 'T卖' }} {{ p.price }}
-                <em class="t-tag">{{ p.strategy }}</em>
-                <template v-if="p.grade"><em class="t-strength" :class="p.grade === '强' ? 'up' : (p.grade === '弱' ? 'down' : '')">{{ p.grade }}{{ p.strength }}</em></template>
-                <template v-if="p.deviation !== null && p.deviation !== undefined">（{{ fmtPct(p.deviation) }}）</template>
-              </span>
-            </div>
+            <details class="t-raw" v-if="tPoints.length">
+              <summary>原始信号 {{ tPoints.length }} 个，默认只看上面的加权买点</summary>
+              <div class="t-list">
+                <span v-for="p in tPoints.slice(0, 20)" :key="p.time + p.type + p.strategy" class="tag" :class="p.type === 'buy' ? 'hot' : 'cold'">
+                  {{ p.time }} {{ p.type === 'buy' ? 'T买' : 'T卖' }} {{ p.price }}
+                  <em class="t-tag">{{ p.strategy }}</em>
+                  <template v-if="p.grade"><em class="t-strength" :class="p.grade === '强' ? 'up' : (p.grade === '弱' ? 'down' : '')">{{ p.grade }}{{ p.strength }}</em></template>
+                  <template v-if="p.deviation !== null && p.deviation !== undefined">（{{ fmtPct(p.deviation) }}）</template>
+                </span>
+              </div>
+            </details>
             <div class="t-stats">
               <span class="tag" v-for="s in tStrategies" :key="s.name" :title="s.note">
                 {{ s.name }} · 目标 {{ s.target }}% / 止损 {{ s.stop }}%
@@ -511,18 +523,22 @@ export default {
 
             <div class="t-adv" v-if="adv">
               <div class="t-adv-head">
-                <span class="tag hot">深度加权</span>
+                <span class="tag hot">加权做T计划</span>
                 <span class="muted small">{{ adv.summary }}</span>
                 <button class="ghost-btn" :disabled="advLoading" @click="loadAdv(true)">
                   {{ advLoading ? '重算中…' : '重算' }}
                 </button>
+                <span class="muted small" v-if="advLoading && !adv">正在加载股性与加权…</span>
               </div>
 
               <div class="t-adv-meta">
                 <span class="tag">{{ adv.tier }}股</span>
-                <span class="tag">指数权重 {{ adv.weights.env }}%</span>
-                <span class="tag">量能权重 {{ adv.weights.vol }}%</span>
-                <span class="tag">股性权重 {{ adv.weights.prior }}%</span>
+                <span class="tag" v-if="adv.plan.open">开盘 {{ adv.plan.open }}</span>
+                <span class="tag" v-if="adv.plan.open_gap !== null && adv.plan.open_gap !== undefined"
+                      :class="adv.plan.open_gap >= 0 ? 'up' : 'down'">
+                  现价较开盘 {{ adv.plan.open_gap > 0 ? '+' : '' }}{{ adv.plan.open_gap }}%
+                </span>
+                <span class="tag">指数 {{ adv.weights.env }}% / 量能 {{ adv.weights.vol }}% / 股性 {{ adv.weights.prior }}%</span>
                 <span class="muted small">{{ adv.updated_at }}</span>
               </div>
 
@@ -535,24 +551,37 @@ export default {
               </div>
 
               <div class="t-adv-list">
-                <div class="t-adv-row" v-for="p in adv.points" :key="p.time + p.type + p.strategy">
+                <div class="t-adv-row" v-for="(p, i) in adv.plan.buys" :key="p.time + p.strategy_key">
+                  <span class="t-adv-idx num">{{ i + 1 }}</span>
                   <span class="t-adv-time num">{{ p.time }}</span>
-                  <span class="tag" :class="p.type === 'buy' ? 'hot' : 'cold'">{{ p.type === 'buy' ? 'T买' : 'T卖' }}</span>
+                  <span class="tag hot">T买</span>
                   <span class="num">{{ p.price }}</span>
-                  <span class="t-adv-arrow">→</span>
-                  <span class="num" :class="p.type === 'buy' ? 'up' : 'down'">
-                    目标 {{ p.target_price }}（{{ p.dyn_target }}%）
-                  </span>
                   <span class="t-strength" :class="advTone(p.grade)">{{ p.grade }}{{ p.strength }}</span>
                   <span class="t-adv-tag" :class="p.energy === 'expanding' ? 'up' : (p.energy === 'shrinking' ? 'down' : '')">
                     {{ p.energy_label }} ×{{ p.energy_ratio }}
                   </span>
-                  <span class="t-adv-expect">{{ p.expect }}</span>
-                  <span class="t-adv-prior" v-if="p.prior_wr !== null && p.prior_wr !== undefined">
-                    同类 {{ p.prior_wr }}%（{{ p.prior_samples }} 例）
+                  <span class="t-adv-expect">
+                    {{ p.expect }}
+                    <template v-if="p.gap_from_last">，较上一个买点再跌 {{ p.gap_from_last }}%</template>
                   </span>
                 </div>
-                <div class="muted small" v-if="!adv.points.length">当前没有可加权的做T信号</div>
+                <div class="muted small" v-if="!adv.plan.buys.length">
+                  今天还没有达标的加权买点，等下一次共振再说
+                </div>
+              </div>
+
+              <div class="t-plan-notes">
+                <div v-if="adv.plan.next_buy">
+                  下一次买点：跌到 <b class="num">{{ adv.plan.next_buy.price }}</b>
+                  （较上一个买点 -{{ adv.plan.next_buy.gap }}%）才会再提示
+                </div>
+                <div v-if="adv.plan.t_out_lines && adv.plan.t_out_lines.length">
+                  图上虚线为预估 T 出：
+                  <span class="tag" v-for="(l, i) in adv.plan.t_out_lines" :key="i">
+                    {{ l.label }} {{ l.price }}
+                  </span>
+                </div>
+                <div class="muted small">{{ adv.plan.rule }}</div>
               </div>
 
               <div class="t-persona" v-if="adv.persona && adv.persona.ok">
