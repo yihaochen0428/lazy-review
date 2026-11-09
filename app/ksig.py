@@ -225,6 +225,14 @@ def _sell_hits(i, a, m):
             and m["vr"] <= 1.0 and _dead_cross(a, i)):
         hits.append({"key": "kdj_dead", "title": "高位死叉",
                      "base": 42, "detail": f"高位缩量，KDJ 死叉（K {k_val:.1f}）"})
+
+    # 6) 反弹衰竭：下跌途中（跌破 MA20 较远）冲高回落，收盘贴近当日最低
+    #    覆盖松发 11-09 这类形态：非高位放量的卖点盲区
+    if (m["c"] < ma20 and m["dev20"] <= -3 and m["chg"] >= -3
+            and (m["upper"] >= 2.0 or m["close_pos"] <= 0.25)
+            and 0.7 <= m["vr"] <= 1.6 and m["pos20"] <= 0.45):
+        hits.append({"key": "fade", "title": "反弹衰竭",
+                     "base": 48, "detail": f"下跌途中冲高回落（上影 {m['upper']:.1f}%，收在全天{int(m['close_pos'] * 100)}% 位置）"})
     return hits
 
 

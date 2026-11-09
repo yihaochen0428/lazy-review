@@ -357,6 +357,13 @@ def build_dashboard(date: str = None, force: bool = False):
         except Exception:  # noqa: BLE001
             overview = None
 
+    index_volume = None
+    if is_latest:
+        try:
+            index_volume = index_volume_state()
+        except Exception:  # noqa: BLE001
+            index_volume = None
+
     payload = {
         "date": target,
         "latest_date": latest,
@@ -364,6 +371,7 @@ def build_dashboard(date: str = None, force: bool = False):
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "refresh": _analysis_meta(),
         "indices": indices,
+        "index_volume": index_volume,
         "breadth": breadth,
         "sentiment": sentiment,
         "overview": overview,
@@ -683,12 +691,37 @@ def advanced_t(code: str, force: bool = False):
         # 把信号收敛成可执行计划：一天最多两次买点，T出画在图上
         scored.sort(key=lambda x: x.get("index") or 0)
         plan = tscore.make_plan(scored, open_price)
+
+        # 大盘日内量能形态：早盘放量后一路萎缩 → 反弹空间有限，T出目标下调；
+        # 早盘缩量午后续增 → 有增量资金，T出目标上调
+        ivol = None
+        ivol_note = ""
+        try:
+            ivol = index_volume_state()
+        except Exception:  # noqa: BLE001
+            ivol = None
+        if ivol and plan.get("t_out_lines"):
+            trend = ivol.get("trend")
+            factor = 0.8 if trend == "fade" else (1.1 if trend == "build" else None)
+            if factor:
+                buy_by_time = {b.get("time"): b for b in plan.get("buys") or []}
+                for line in plan["t_out_lines"]:
+                    if line.get("kind") != "estimate":
+                        continue
+                    base = buy_by_time.get(line.get("time"))
+                    base_price = (base or {}).get("price")
+                    if base_price and line.get("price"):
+                        line["price"] = round(base_price + (line["price"] - base_price) * factor, 2)
+                ivol_note = ("大盘早盘放量后萎缩，T出目标已下调" if trend == "fade"
+                             else "大盘午后量能续增，T出目标已上调")
+
         stock_overall = stock_energy_state(bars, base_vol) or {}
         t_out = plan.get("t_out")
         summary = (
             f"{tier}股 · 买点 {plan['buy_count']} 次（当日上限 {plan['max_buys']} 次）；"
             f"个股量能{stock_overall.get('label_cn') or '常规'}"
             + (f"；T出参考 {t_out['price']:.2f}" if t_out else "")
+            + (f"；{ivol_note}" if ivol_note else "")
         )
         return {
             "code": code,
@@ -709,6 +742,7 @@ def advanced_t(code: str, force: bool = False):
                 "index": index_e,
             },
             "plan": plan,
+            "index_volume": ivol,
             "signal_count": len(scored),
             "persona": profile,
             "experience": experience,
@@ -720,7 +754,7 @@ def advanced_t(code: str, force: bool = False):
 
     if force:
         return cached_call(f"tadv:force:{code}:{stamp}:{time.time()}", 1, producer)
-    return cached_call(f"tadv:v2:{code}:{stamp}", 300, producer)
+    return cached_call(f"tadv:v3:{code}:{stamp}", 300, producer)
 
 
 def stock_energy_state(bars, base_vol):
@@ -730,6 +764,83 @@ def stock_energy_state(bars, base_vol):
     idx = len(bars) - 1
     b = tscore.bin_index(bars[idx].get("time"))
     return tscore.energy_state(bars, idx, base_vol[b] if b is not None else None)
+
+
+def index_volume_state():
+    """大盘日内量能形态：跟踪早盘 vs 午后的放量/缩量（上证 + 创业板，5 分钟线）
+
+    回答的问题：今天大盘相比前一天是缩量还是放量？早盘放量之后午后是不是一路萎缩？
+    - morning_ratio：早盘（≤11:30）量能 / 昨日同时段
+    - pm_ratio：午后（≥13:05 至最新）量能 / 昨日同时段，None 表示午后还没走
+    - trend：fade（早盘放量午后萎缩）/ build（早盘缩量午后放量）/
+              strong_open / weak_open / flat
+    """
+    def producer():
+        out = {}
+        for secid, name in (("1.000001", "上证"), ("0.399006", "创业板")):
+            try:
+                bars = em.fetch_minute_kline(secid, 5, 96, 2)["bars"]
+            except Exception:  # noqa: BLE001
+                continue
+            days = {}
+            for b in bars:
+                days.setdefault((b.get("date") or "")[:10], []).append(b)
+            if len(days) < 2:
+                continue
+            prev_day, cur_day = sorted(days)[-2:]
+            prev, cur = days[prev_day], days[cur_day]
+
+            def vol(rows, until=None, since=None):
+                total = 0.0
+                for r in rows:
+                    t = r.get("time") or (r.get("date") or "")[11:16]
+                    if until and t > until:
+                        continue
+                    if since and t < since:
+                        continue
+                    total += r.get("volume") or 0
+                return total
+
+            last_t = (cur[-1].get("time") or (cur[-1].get("date") or "")[11:16]) if cur else "15:00"
+            cur_m, prev_m = vol(cur, until="11:30"), vol(prev, until="11:30")
+            cur_pm, prev_pm = vol(cur, since="13:05", until=last_t), vol(prev, since="13:05", until=last_t)
+            cur_now, prev_same = vol(cur, until=last_t), vol(prev, until=last_t)
+            out[name] = {
+                "date": cur_day,
+                "morning_ratio": round(cur_m / prev_m, 2) if prev_m else None,
+                "pm_ratio": round(cur_pm / prev_pm, 2) if prev_pm and cur_pm else None,
+                "day_ratio": round(cur_now / prev_same, 2) if prev_same else None,
+                "last_time": last_t,
+            }
+        if not out:
+            return None
+
+        def avg(key):
+            vals = [v[key] for v in out.values() if v.get(key) is not None]
+            return round(sum(vals) / len(vals), 2) if vals else None
+
+        m_r, d_r, p_r = avg("morning_ratio"), avg("day_ratio"), avg("pm_ratio")
+        last_time = max((v.get("last_time") or "00:00") for v in out.values())
+        has_pm = p_r is not None and last_time > "13:05"
+        if m_r is not None and m_r >= 1.08 and has_pm and p_r <= 0.92:
+            trend, label = "fade", "早盘放量 · 午后缩量"
+        elif m_r is not None and m_r <= 0.92 and has_pm and p_r >= 1.08:
+            trend, label = "build", "早盘缩量 · 午后放量"
+        elif m_r is not None and m_r >= 1.08:
+            trend, label = "strong_open", "早盘放量"
+        elif m_r is not None and m_r <= 0.92:
+            trend, label = "weak_open", "早盘缩量"
+        else:
+            trend, label = "flat", "量能平稳"
+        note = f"早盘量能约为昨日同期 {m_r if m_r is not None else '-'} 倍"
+        if has_pm:
+            note += f"，午后 {p_r} 倍"
+        elif last_time <= "11:30":
+            note += "（午后未开始）"
+        return {"trend": trend, "label": label, "morning_ratio": m_r,
+                "pm_ratio": p_r, "day_ratio": d_r, "note": note, "indices": out}
+
+    return cached_call("ivol:state:v1", 60, producer)
 
 
 def _intraday_detail(code: str):

@@ -59,6 +59,7 @@ export default {
     const hotConcepts = computed(() => (dash.value?.limitup?.concepts || []).slice(0, 10));
     const outlook = computed(() => sentiment.value?.outlook || null);
     const overview = computed(() => dash.value?.overview || null);
+    const ivol = computed(() => dash.value?.index_volume || null);
     const refresh = computed(() => dash.value?.refresh || null);
     const distMax = computed(() => Math.max(1, ...((overview.value?.distribution || []).map((b) => b.count))));
     const breadthTotal = computed(() => {
@@ -216,7 +217,7 @@ export default {
 
     return {
       state, go, dash, loading, indices, breadth, sentiment, outlook, sentimentOption, ai, ladder,
-      overview, refresh, distMax, distHeight, share, fmtYi,
+      overview, ivol, refresh, distMax, distHeight, share, fmtYi,
       ladderStats, ladderLevels, maxBoard, stats, hotConcepts,
       sectorType, sectorSort, sectorItems, sectorLoading,
       switchType, switchSort, upRatio, openSector, openStock, visibleStocks, toggleLevel,
@@ -358,6 +359,13 @@ export default {
                   近60日平均 {{ fmtYi(overview.amount.avg60) }}亿
                   <b :class="tone(overview.amount.avg60_pct)">{{ signed(overview.amount.avg60_pct) }}%</b>
                 </small>
+              </span>
+            </div>
+            <div class="mo-row" v-if="ivol">
+              <span class="mo-k">量能形态</span>
+              <span class="mo-v">
+                <b :class="ivol.trend === 'fade' ? 'down' : (ivol.trend === 'build' ? 'up' : 'flat')">{{ ivol.label }}</b>
+                <small>{{ ivol.note }}</small>
               </span>
             </div>
           </div>
