@@ -537,16 +537,23 @@ export function klineOption(data, indicator = "MACD", options = {}) {
         return `${v[2]} · ${v[3]} · ${v[5]}分<br/><span style="color:#a3adc0;font-size:10.5px">${v[4]}</span>`;
       },
     },
-    // 弱信号（<52）缩小淡化，强/中信号正常气泡
+    // 弱信号（<52）缩小淡化；强信号（>=65）金色外圈突出
     data: list.map((s) => {
       const weak = s.score < 52;
+      const strong = s.score >= 65;
       return {
         value: [
           s.index,
           edge === "below" ? (s.low || s.price) * 0.985 : (s.high || s.price) * 1.015,
           s.side === "buy" ? "买" : "卖", s.type, s.reason || "", s.score,
         ],
-        itemStyle: { opacity: weak ? 0.4 : 1 },
+        itemStyle: {
+          opacity: weak ? 0.4 : 1,
+          borderColor: strong ? GOLD : "rgba(255,255,255,.85)",
+          borderWidth: strong ? 2 : 1,
+          shadowBlur: strong ? 6 : 0,
+          shadowColor: strong ? "rgba(242,184,69,.8)" : "transparent",
+        },
       };
     }),
     z: 7,

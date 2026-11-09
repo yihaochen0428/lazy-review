@@ -46,8 +46,8 @@ def _env_label(score):
 
 
 def _combined_env(idx_score, sector_score):
-    """大盘 0.5 / 板块 0.5 加权；缺项时按剩余权重归一"""
-    vals = [(0.5, idx_score), (0.5, sector_score)]
+    """大盘 0.35 / 板块 0.65 加权：板块轮动常先于大盘反弹，权重向板块倾斜；缺项时归一"""
+    vals = [(0.35, idx_score), (0.65, sector_score)]
     vals = [(w, v) for w, v in vals if v is not None]
     if not vals:
         return None
