@@ -493,10 +493,20 @@ def stock_detail(code: str, klt: int = 101):
         chan = chan_src.analyze(bars, m["dif"])
     except Exception:  # noqa: BLE001
         chan = None
-    # 日K量价买卖信号：量价为主、指标共振为辅；盘中跳过未收完的最后一根日K
+    # 日K量价买卖信号：量价为主、指标共振为辅；大盘 + 板块双环境加权调级
+    # 盘中跳过未收完的最后一根日K
     try:
-        signals = ksig.detect(bars, env=ksig.env_score_live(),
+        board_names = [b.get("name") for b in (context or {}).get("boards", [])]
+        sector = tenv._match_sector(board_names)  # noqa: SLF001
+        sector_score = None
+        if sector:
+            etf = tenv.ETF_PROXY.get(sector)
+            if etf:
+                sector_score = (dkline.daily(etf[0]) or {}).get("score")
+        signals = ksig.detect(bars, env=ksig.env_score_live(), sector_env=sector_score,
                               skip_last=analysis_phase()[0] == "auction")
+        if signals is not None:
+            signals["sector"] = sector
     except Exception:  # noqa: BLE001
         signals = None
     return {

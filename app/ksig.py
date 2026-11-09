@@ -45,6 +45,20 @@ def _env_label(score):
     return "空头"
 
 
+def _combined_env(idx_score, sector_score):
+    """大盘 0.5 / 板块 0.5 加权；缺项时按剩余权重归一"""
+    vals = [(0.5, idx_score), (0.5, sector_score)]
+    vals = [(w, v) for w, v in vals if v is not None]
+    if not vals:
+        return None
+    total = sum(w for w, _ in vals)
+    return round(sum(w * v for w, v in vals) / total, 3)
+
+
+def _downgrade(grade):
+    return {"强": "中", "中": "弱", "弱": "弱"}.get(grade, grade)
+
+
 # ---------------------------------------------------------------- 指标序列
 def _arrays(bars):
     closes = [b.get("close") or 0 for b in bars]
@@ -324,11 +338,15 @@ def _env_at(env, i):
 
 
 # ---------------------------------------------------------------- 主入口
-def detect(bars, env=None, skip_last=False, max_items=40):
+def detect(bars, env=None, sector_env=None, skip_last=False, max_items=40):
     """识别买卖信号
 
-    env: None / 单个环境分 / 与 bars 等长的环境分数组（回测用，逐日不同）
+    env: 大盘环境（None / 单个分 / 与 bars 等长数组）
+    sector_env: 板块环境（同上证口径，加权 0.5）
     skip_last: 盘中跳过未收完的最后一根日K
+
+    策略调整：大盘+板块加权环境 <= -0.15 时买点降级（强→中→弱），
+    >= 0.15 时卖点降级，避免逆势操作。
     """
     n = len(bars or [])
     empty = {"items": [], "latest_buy": None, "latest_sell": None,
@@ -343,16 +361,24 @@ def detect(bars, env=None, skip_last=False, max_items=40):
         m = _metrics(i, a)
         if not m:
             continue
-        env_v = _env_at(env, i)
+        env_v = _combined_env(_env_at(env, i), _env_at(sector_env, i))
         buys, sells = _buy_hits(i, a, m), _sell_hits(i, a, m)
         if buys:
             score, notes = _score_buy(i, a, m, buys, env_v)
-            if _grade(score) and score >= 45:
-                raw.append(_item(bars, i, "buy", m, buys, score, notes))
+            grade = _grade(score)
+            if grade and score >= 45:
+                if env_v is not None and env_v <= -0.15:
+                    grade = _downgrade(grade)
+                    notes = notes + ["大盘/板块偏空，降级"]
+                raw.append(_item(bars, i, "buy", m, buys, score, notes, grade))
         if sells:
             score, notes = _score_sell(i, a, m, sells, env_v)
-            if _grade(score) and score >= 45:
-                raw.append(_item(bars, i, "sell", m, sells, score, notes))
+            grade = _grade(score)
+            if grade and score >= 45:
+                if env_v is not None and env_v >= 0.15:
+                    grade = _downgrade(grade)
+                    notes = notes + ["大盘/板块偏强，降级"]
+                raw.append(_item(bars, i, "sell", m, sells, score, notes, grade))
     items = _dedup(raw)[-max_items:]
     buys = [x for x in items if x["side"] == "buy"]
     sells = [x for x in items if x["side"] == "sell"]
@@ -365,10 +391,16 @@ def detect(bars, env=None, skip_last=False, max_items=40):
         parts.append(f"最近卖点 {latest_sell['date'][5:]} {latest_sell['type']}（{latest_sell['score']} 分 · {latest_sell['grade']}）")
     if not parts:
         parts.append("近期未出现有效量价信号")
-    env_end = _env_at(env, end)
+    env_end = _combined_env(_env_at(env, end), _env_at(sector_env, end))
+    idx_end = _env_at(env, end)
+    sec_end = _env_at(sector_env, end)
     caution = ""
     if env_end is not None and env_end <= -0.15 and buys:
-        caution = f"大盘{_env_label(env_end)}，量价买点在下跌市胜率偏低，只宜小仓位试错"
+        caution = (f"大盘{_env_label(idx_end)}、板块{_env_label(sec_end)}，买点已降级，"
+                   "下跌市里量价买点胜率偏低，只宜小仓位试错")
+    elif env_end is not None and env_end >= 0.15 and sells:
+        caution = (f"大盘{_env_label(idx_end)}、板块{_env_label(sec_end)}，卖点已降级，"
+                   "强势环境里减仓信号容易卖飞，可等跌破 MA20 再执行")
     return {
         "items": items,
         "latest_buy": latest_buy,
@@ -376,13 +408,17 @@ def detect(bars, env=None, skip_last=False, max_items=40):
         "counts": {"buy": len(buys), "sell": len(sells)},
         "summary": "；".join(parts),
         "env": round(env_end, 3) if env_end is not None else None,
+        "env_index": round(idx_end, 3) if idx_end is not None else None,
+        "env_sector": round(sec_end, 3) if sec_end is not None else None,
         "env_label": _env_label(env_end),
+        "env_index_label": _env_label(idx_end),
+        "env_sector_label": _env_label(sec_end),
         "caution": caution,
         "note": NOTE,
     }
 
 
-def _item(bars, i, side, m, hits, score, notes):
+def _item(bars, i, side, m, hits, score, notes, grade=None):
     reasons = [h["detail"] for h in hits] + notes
     return {
         "index": i,
@@ -392,7 +428,7 @@ def _item(bars, i, side, m, hits, score, notes):
         "type": hits[0]["title"],
         "score": score,
         "strength": score,
-        "grade": _grade(score),
+        "grade": grade or _grade(score),
         "price": round(m["c"], 2),
         "high": round(m["h"], 2),
         "low": round(m["l"], 2),
@@ -498,22 +534,25 @@ def _base_stat(rows):
 
 def _pool():
     from .analysis import SECTOR_PLAYS
+    from . import tenv
 
     seen, pool = set(), []
-    for _sector, info in SECTOR_PLAYS.items():
+    for sector, info in SECTOR_PLAYS.items():
         picks = list((info.get("leaders") or [])[:2]) + list((info.get("small") or [])[:1])
         for item in picks:
             code, name = item[0], item[1]
             if code in seen:
                 continue
             seen.add(code)
-            pool.append((code, name))
+            pool.append((code, name, sector if sector in tenv.ETF_PROXY else None))
     return pool
 
 
 def _run_backtest(days=60):
     days = max(20, min(int(days or 60), 120))
     pool = _pool()
+    from . import tenv
+
     env_cache = {}
 
     def env_of(day):
@@ -527,9 +566,31 @@ def _run_backtest(days=60):
         env_cache[day] = round(sum(scores) / len(scores), 3) if scores else None
         return env_cache[day]
 
+    etf_bars_cache = {}
+
+    def _etf_bars(sector):
+        if sector not in etf_bars_cache:
+            secid = tenv.ETF_PROXY[sector][0]
+            try:
+                etf_bars_cache[sector] = em.fetch_kline(secid, 101, days + 90)["bars"]
+            except Exception:  # noqa: BLE001
+                etf_bars_cache[sector] = []
+        return etf_bars_cache[sector]
+
+    sector_env_cache = {}
+
+    def sector_env_of(sector, day):
+        if not sector:
+            return None
+        key = (sector, day)
+        if key not in sector_env_cache:
+            ctx = dkline.index_ctx(_etf_bars(sector), day)
+            sector_env_cache[key] = ctx.get("score") if ctx else None
+        return sector_env_cache[key]
+
     rows, base_rows, sell_rows = [], [], []
     skipped = {"limit_day": 0, "limit_up": 0, "no_entry": 0}
-    for code, name in pool:
+    for code, name, sector in pool:
         secid = f"{em.market_prefix(code)}.{code}"
         try:
             bars = em.fetch_kline(secid, 101, days + 90)["bars"]
@@ -538,9 +599,11 @@ def _run_backtest(days=60):
         n = len(bars)
         if n < 60:
             continue
-        env_series = [env_of((b.get("date") or "")[:10]) for b in bars]
+        dates = [(b.get("date") or "")[:10] for b in bars]
+        env_series = [env_of(day) for day in dates]
+        sec_series = [sector_env_of(sector, day) for day in dates]
         try:
-            detected = detect(bars, env=env_series)
+            detected = detect(bars, env=env_series, sector_env=sec_series)
         except Exception:  # noqa: BLE001
             continue
         item_map = {it["index"]: it for it in detected["items"]}

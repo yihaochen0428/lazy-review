@@ -524,32 +524,29 @@ export function klineOption(data, indicator = "MACD", options = {}) {
     name,
     symbolSize: (value, params) => {
       const score = params.data && params.data.value ? params.data.value[5] : 0;
-      return score >= 65 ? 10 : (score >= 52 ? 7 : 5);
+      return score >= 65 ? 15 : (score >= 52 ? 12 : 9);
     },
-    itemStyle: { color: "rgba(10,14,21,.92)", borderColor: color, borderWidth: 1.4 },
+    itemStyle: { color, borderColor: "rgba(255,255,255,.85)", borderWidth: 1 },
     label: {
-      show: true, position: edge === "below" ? "bottom" : "top", color, fontSize: 9,
-      backgroundColor: "rgba(10,14,21,.86)", borderColor: "rgba(255,255,255,.16)",
-      borderWidth: 1, borderRadius: 3, padding: [1, 3],
+      show: true, position: "inside", color: "#fff", fontSize: 9, fontWeight: 600,
       formatter: (p) => p.value[2],
     },
     tooltip: {
       formatter: (p) => {
         const v = p.value || [];
-        return `${v[3]} · ${v[2]}<br/><span style="color:#a3adc0;font-size:10.5px">${v[4]}</span>`;
+        return `${v[2]} · ${v[3]} · ${v[5]}分<br/><span style="color:#a3adc0;font-size:10.5px">${v[4]}</span>`;
       },
     },
-    // 弱信号（<52）只画小点、不写标签，避免图上噪声
+    // 弱信号（<52）缩小淡化，强/中信号正常气泡
     data: list.map((s) => {
       const weak = s.score < 52;
       return {
         value: [
           s.index,
-          edge === "below" ? (s.low || s.price) * 0.988 : (s.high || s.price) * 1.012,
-          `${s.side === "buy" ? "B" : "S"}${s.score}`, s.type, s.reason || "", s.score,
+          edge === "below" ? (s.low || s.price) * 0.985 : (s.high || s.price) * 1.015,
+          s.side === "buy" ? "买" : "卖", s.type, s.reason || "", s.score,
         ],
-        label: { show: !weak },
-        itemStyle: { opacity: weak ? 0.55 : 1, borderWidth: weak ? 1 : 1.4 },
+        itemStyle: { opacity: weak ? 0.4 : 1 },
       };
     }),
     z: 7,

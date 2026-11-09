@@ -869,7 +869,7 @@ export default {
                   <b>量价信号</b>
                   <span class="tag hot" v-if="sigCounts.buy">买 {{ sigCounts.buy }}</span>
                   <span class="tag cold" v-if="sigCounts.sell">卖 {{ sigCounts.sell }}</span>
-                  <span class="muted small">弱信号图上淡化</span>
+                  <span class="muted small" v-if="signals.env_label">大盘{{ signals.env_index_label }}<template v-if="signals.sector"> · {{ signals.sector }}{{ signals.env_sector_label }}</template></span>
                 </div>
                 <div class="sig-sum">{{ signals.summary }}</div>
                 <div class="sig-warn" v-if="signals.caution">{{ signals.caution }}</div>
