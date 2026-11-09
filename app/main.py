@@ -176,6 +176,14 @@ def t_backtest(days: int = Query(default=10), force: bool = Query(default=False)
         return fail(f"做T回测失败：{exc}")
 
 
+@app.get("/api/t/advanced/{code}")
+def t_advanced(code: str, force: bool = Query(default=False)):
+    try:
+        return market.advanced_t(code, force)
+    except Exception as exc:  # noqa: BLE001
+        return fail(f"深度加权分析失败：{exc}")
+
+
 @app.get("/api/open/backtest")
 def open_backtest(days: int = Query(default=20), force: bool = Query(default=False)):
     try:

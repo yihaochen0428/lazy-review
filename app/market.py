@@ -9,6 +9,8 @@ from . import research
 from . import chan as chan_src
 from . import intraday
 from . import tenv
+from . import tscore
+from . import persona
 from . import dkline
 from . import opening
 from . import overview as overview_src
@@ -520,6 +522,188 @@ def t_backtest(days: int = 10, force: bool = False):
 def open_backtest(days: int = 20, force: bool = False):
     """开盘买入建议回测：全部开盘买入 vs 建议买入组的胜率"""
     return opening.backtest(days, force, analysis_phase()[0])
+
+
+def _bars_of(secid):
+    try:
+        return em.fetch_minute_kline(secid, 5, 240, 1).get("bars") or []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _energy_at(bars, index):
+    if not bars:
+        return None
+    idx = len(bars) - 1 if index is None else max(0, min(index, len(bars) - 1))
+    return tscore.energy_state(bars, idx)
+
+
+def _blend_energy(stock_e, sector_e, index_e):
+    """个股 50% / 板块 30% / 大盘 20% 投票出综合量能方向"""
+    parts = [(stock_e, 0.5), (sector_e, 0.3), (index_e, 0.2)]
+    total = 0.0
+    score = 0.0
+    for item, weight in parts:
+        if not item:
+            continue
+        total += weight
+        if item.get("label") == "expanding":
+            score += weight
+        elif item.get("label") == "shrinking":
+            score -= weight
+    if not total:
+        return "normal"
+    ratio = score / total
+    if ratio >= 0.5:
+        return "expanding"
+    if ratio <= -0.3:
+        return "shrinking"
+    return "normal"
+
+
+def advanced_t(code: str, force: bool = False):
+    """深度加权做T分析：量能空间判断 + 分层权重 + 20 日股性经验库
+
+    用户手动触发，结果缓存 5 分钟，避免分时自动刷新时重复计算。
+    """
+    secid = f"{em.market_prefix(code)}.{code}"
+    stamp = datetime.now().strftime("%Y%m%d") + ":" + analysis_phase()[0]
+
+    def producer():
+        meta = em.fetch_stock_meta(code)
+        minute = em.fetch_minute_kline(secid, 5, 240, 1)
+        bars = minute.get("bars") or []
+        if not bars:
+            raise em.DataError("分时数据不可用")
+        daily = em.fetch_kline(secid, 101, 120)["bars"]
+        price = bars[-1].get("close")
+        tier, weights = tscore.tier_of(meta.get("float_cap"))
+        persona_data = {"profile": {"ok": False}, "experience": {"ok": False}, "base_vol": [None] * 8}
+        try:
+            persona_data = persona.snapshot(secid, code)
+        except Exception:  # noqa: BLE001
+            pass
+        profile = persona_data.get("profile") or {"ok": False}
+        experience = persona_data.get("experience") or {"ok": False}
+        base_vol = persona_data.get("base_vol") or [None] * 8
+
+        # 环境分：指数 / 板块 ETF / 个股相对（复用现有口径）
+        try:
+            context = _stock_context(code, meta, daily, price)
+        except Exception:  # noqa: BLE001
+            context = None
+        boards = [b.get("name") for b in (context or {}).get("boards", [])]
+        env = {"score": 0.0, "label": "中性", "note": ""}
+        try:
+            dk = dkline.state(daily, datetime.now().strftime("%Y-%m-%d"))
+            mkt = dkline.index_daily()
+            env = tenv.build_env(bars, minute.get("prev_close"), boards, dk, mkt)
+        except Exception:  # noqa: BLE001
+            pass
+        limit = tenv.limit_state(daily, code)
+
+        # 板块 / 大盘 量能（各取一次分时线，逐点按位置计算）
+        sector_bars = []
+        sector_name = ""
+        try:
+            sector = tenv._match_sector(boards)  # noqa: SLF001
+            if sector:
+                proxy = tenv.ETF_PROXY.get(sector)
+                sector_name = sector
+                if proxy:
+                    sector_bars = _bars_of(proxy[0])
+        except Exception:  # noqa: BLE001
+            pass
+        sector_e = _energy_at(sector_bars, None)
+        index_bars = _bars_of(tenv.INDEXES[0][0])
+        index_e = _energy_at(index_bars, None)
+
+        closes = [b.get("close") or 0 for b in bars]
+        dif = macd(closes)["dif"]
+        base = intraday.t_points(bars, minute.get("prev_close"), dif, max_points=40)
+        points = base.get("points") or []
+        if limit.get("distorted"):
+            points = []
+
+        scored = []
+        for point in points:
+            b = tscore.bin_index(point.get("time"))
+            stock_e = tscore.energy_state(bars, point.get("index") or 0,
+                                          base_vol[b] if b is not None else None)
+            sector_i = _energy_at(sector_bars, point.get("index"))
+            index_i = _energy_at(index_bars, point.get("index"))
+            label = _blend_energy(stock_e, sector_i, index_i)
+            blended = dict(stock_e)
+            blended["label"] = label
+            blended["label_cn"] = tscore.ENERGY_LABELS[label]
+            ctx = {
+                "weights": weights,
+                "env_score": env.get("score") or 0.0,
+                "energy": blended,
+                "bars": bars,
+                "prior_wr": None,
+                "prior_samples": 0,
+                "strategy_weight": persona.strategy_weight(experience, point.get("strategy_key")),
+            }
+            prior_wr, prior_samples = persona.prior_win_rate(
+                experience, point.get("strategy_key"), point.get("type"),
+                point.get("time"), label)
+            ctx["prior_wr"] = prior_wr
+            ctx["prior_samples"] = prior_samples
+            item = tscore.score_point(point, ctx)
+            item["stock_energy"] = stock_e
+            scored.append(item)
+
+        # 盘中需要看到全部买卖点：按时间顺序返回，强度作为每行的加权结论
+        scored.sort(key=lambda x: x.get("index") or 0)
+        top = scored
+        strong = sum(1 for p in top if p.get("grade") == "强")
+        buys = sum(1 for p in top if p.get("type") == "buy")
+        stock_overall = stock_energy_state(bars, base_vol) or {}
+        summary = ("当前无可加权信号" if not scored else
+                   f"{tier}股 · 共 {len(scored)} 个信号，加权后强信号 {strong} 个"
+                   f"（买 {buys} / 卖 {len(top) - buys}）；"
+                   f"最新量能：个股{stock_overall.get('label_cn') or '常规'}")
+        return {
+            "code": code,
+            "name": meta.get("name") or code,
+            "tier": tier,
+            "float_cap": meta.get("float_cap"),
+            "weights": tscore.weight_payload(weights),
+            "env": {
+                "score": env.get("score"),
+                "label": env.get("label"),
+                "note": env.get("note"),
+                "sector": (env.get("sector") or {}).get("name"),
+                "relative": env.get("relative"),
+            },
+            "energy": {
+                "stock": stock_energy_state(bars, base_vol),
+                "sector": {"name": sector_name, **(sector_e or {})} if sector_e else None,
+                "index": index_e,
+            },
+            "points": top,
+            "signal_count": len(scored),
+            "persona": profile,
+            "experience": experience,
+            "limit": limit,
+            "summary": summary,
+            "note": "加权为量能 + 股性先验的置信度评估，目标价为预期空间，不构成收益承诺",
+            "updated_at": datetime.now().strftime("%H:%M:%S"),
+        }
+
+    if force:
+        return cached_call(f"tadv:force:{code}:{stamp}:{time.time()}", 1, producer)
+    return cached_call(f"tadv:v1:{code}:{stamp}", 300, producer)
+
+
+def stock_energy_state(bars, base_vol):
+    """最新一根的量能状态（个股）"""
+    if not bars:
+        return None
+    idx = len(bars) - 1
+    b = tscore.bin_index(bars[idx].get("time"))
+    return tscore.energy_state(bars, idx, base_vol[b] if b is not None else None)
 
 
 def _intraday_detail(code: str):

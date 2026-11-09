@@ -152,6 +152,49 @@ export default {
     const tEnv = computed(() => (intra.value && intra.value.env) || null);
     const advice = computed(() => (data.value && data.value.open_advice) || null);
 
+    // 深度加权分析：手动触发、结果只留在本组件，不随分时 30 秒刷新重算
+    const adv = ref(null);
+    const advLoading = ref(false);
+    const advError = ref("");
+    async function loadAdv(force = false) {
+      if (advLoading.value) return;
+      const code = meta.value.code || state.stock.code;
+      if (!code) return;
+      advLoading.value = true;
+      advError.value = "";
+      try {
+        adv.value = await api.tAdvanced(code, force);
+      } catch (err) {
+        advError.value = err && err.message ? err.message : String(err);
+      } finally {
+        advLoading.value = false;
+      }
+    }
+    watch(() => meta.value.code, () => {
+      adv.value = null;
+      advError.value = "";
+    });
+    const advEnergy = computed(() => {
+      const energy = adv.value && adv.value.energy;
+      if (!energy) return [];
+      const rows = [
+        { key: "stock", label: "个股量能", item: energy.stock },
+        { key: "sector", label: "板块量能", item: energy.sector },
+        { key: "index", label: "大盘量能", item: energy.index },
+      ];
+      return rows.map((item) => ({
+        key: item.key,
+        label: item.label,
+        name: (item.item && item.item.name) || "",
+        tone: !item.item ? "muted" : item.item.label === "expanding" ? "up"
+          : item.item.label === "shrinking" ? "down" : "",
+        text: !item.item ? "无数据" : `${item.item.label_cn || "常规"} ×${item.item.ratio}`,
+      }));
+    });
+    function advTone(grade) {
+      return grade === "强" ? "up" : grade === "弱" ? "down" : "";
+    }
+
     const bt = ref(null);
     const btLoading = ref(false);
     const btError = ref("");
@@ -266,6 +309,7 @@ export default {
       onIndDragStart, onIndDrop, onIndDragEnd, toggleIndLock, resetIndOrder,
       tPoints, financeRows, industryReports, valuationNotes, valDims, tStrategies, chanFuture,
       tEnv, bt, btLoading, btError, loadBt, advice, ob, obLoading, obError, loadOb,
+      adv, advLoading, advError, loadAdv, advEnergy, advTone,
       closeStock, switchPeriod, onMask, openStock, fmtAmount, fmtNumber, fmtPct, fmtPrice, tone,
     };
   },
@@ -397,6 +441,9 @@ export default {
             <div class="t-head">
               <span class="tag hot">做T点位</span>
               <span class="muted small">均价线回归 / 零轴支撑压力 / MACD 背离 / 量价背离，同向共振信号优先</span>
+              <button class="ghost-btn" :disabled="advLoading" @click="adv ? loadAdv(true) : loadAdv(false)">
+                {{ advLoading ? '分析中…' : (adv ? '重算深度分析' : '深度加权分析') }}
+              </button>
             </div>
             <div class="t-sum">{{ intra.summary }}</div>
 
@@ -458,6 +505,85 @@ export default {
               <span class="tag" v-for="s in tStrategies" :key="s.name" :title="s.note">
                 {{ s.name }} · 目标 {{ s.target }}% / 止损 {{ s.stop }}%
               </span>
+            </div>
+
+            <div class="error-bar" v-if="advError">{{ advError }}</div>
+
+            <div class="t-adv" v-if="adv">
+              <div class="t-adv-head">
+                <span class="tag hot">深度加权</span>
+                <span class="muted small">{{ adv.summary }}</span>
+                <button class="ghost-btn" :disabled="advLoading" @click="loadAdv(true)">
+                  {{ advLoading ? '重算中…' : '重算' }}
+                </button>
+              </div>
+
+              <div class="t-adv-meta">
+                <span class="tag">{{ adv.tier }}股</span>
+                <span class="tag">指数权重 {{ adv.weights.env }}%</span>
+                <span class="tag">量能权重 {{ adv.weights.vol }}%</span>
+                <span class="tag">股性权重 {{ adv.weights.prior }}%</span>
+                <span class="muted small">{{ adv.updated_at }}</span>
+              </div>
+
+              <div class="t-energy">
+                <div class="t-energy-cell" v-for="e in advEnergy" :key="e.key">
+                  <span class="t-env-label">{{ e.label }}</span>
+                  <span class="num" :class="e.tone">{{ e.text }}</span>
+                  <span class="t-env-badge" v-if="e.name">{{ e.name }}</span>
+                </div>
+              </div>
+
+              <div class="t-adv-list">
+                <div class="t-adv-row" v-for="p in adv.points" :key="p.time + p.type + p.strategy">
+                  <span class="t-adv-time num">{{ p.time }}</span>
+                  <span class="tag" :class="p.type === 'buy' ? 'hot' : 'cold'">{{ p.type === 'buy' ? 'T买' : 'T卖' }}</span>
+                  <span class="num">{{ p.price }}</span>
+                  <span class="t-adv-arrow">→</span>
+                  <span class="num" :class="p.type === 'buy' ? 'up' : 'down'">
+                    目标 {{ p.target_price }}（{{ p.dyn_target }}%）
+                  </span>
+                  <span class="t-strength" :class="advTone(p.grade)">{{ p.grade }}{{ p.strength }}</span>
+                  <span class="t-adv-tag" :class="p.energy === 'expanding' ? 'up' : (p.energy === 'shrinking' ? 'down' : '')">
+                    {{ p.energy_label }} ×{{ p.energy_ratio }}
+                  </span>
+                  <span class="t-adv-expect">{{ p.expect }}</span>
+                  <span class="t-adv-prior" v-if="p.prior_wr !== null && p.prior_wr !== undefined">
+                    同类 {{ p.prior_wr }}%（{{ p.prior_samples }} 例）
+                  </span>
+                </div>
+                <div class="muted small" v-if="!adv.points.length">当前没有可加权的做T信号</div>
+              </div>
+
+              <div class="t-persona" v-if="adv.persona && adv.persona.ok">
+                <div class="t-persona-head">
+                  <span class="tag gold">股性画像</span>
+                  <span class="tag">{{ adv.persona.style }}</span>
+                  <span class="muted small">近 {{ adv.persona.sample_days }} 个交易日</span>
+                </div>
+                <div class="persona-bins">
+                  <div class="persona-bin" v-for="(v, i) in adv.persona.high_bin_prob" :key="i"
+                       :title="adv.persona.bins[i] + ' 出现日内高点 ' + v + '%'">
+                    <span class="persona-val num">{{ v }}</span>
+                    <div class="persona-track"><i :style="{ height: Math.max(2, v) + '%' }"></i></div>
+                    <span class="persona-tick">{{ adv.persona.bins[i].slice(0, 5) }}</span>
+                  </div>
+                </div>
+                <div class="t-persona-grid">
+                  <div class="t-persona-cell"><span>早盘冲高概率</span><b class="num">{{ adv.persona.morning_high_prob }}%</b></div>
+                  <div class="t-persona-cell"><span>冲高回落概率</span><b class="num">{{ adv.persona.spike_fade_prob }}%</b></div>
+                  <div class="t-persona-cell"><span>午后走弱概率</span><b class="num">{{ adv.persona.afternoon_weak_prob }}%</b></div>
+                  <div class="t-persona-cell"><span>平均振幅</span><b class="num">{{ adv.persona.avg_amplitude }}%</b></div>
+                </div>
+                <div class="muted small">{{ adv.persona.note }}</div>
+              </div>
+
+              <div class="t-adv-foot muted small" v-if="adv.experience && adv.experience.ok">
+                经验库 {{ adv.experience.start }} ~ {{ adv.experience.end }}（{{ adv.experience.days }} 个交易日 /
+                {{ adv.experience.samples }} 条样本，第 {{ adv.experience.cycles }} 个周期）· 策略适应度：
+                <span v-for="(w, k) in adv.experience.strategy_weights" :key="k" class="tag">{{ k }} {{ w }}</span>
+              </div>
+              <div class="muted small">{{ adv.note }}</div>
             </div>
 
             <div class="t-bt">

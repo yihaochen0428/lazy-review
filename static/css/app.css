@@ -1696,6 +1696,76 @@ table.simple.compact td { padding: 6px 8px; font-size: 11.5px; }
   .t-bt-arrow { display: none; }
 }
 
+/* 做T深度加权分析：全部买卖点 + 量能空间 + 股性经验 */
+.t-adv { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 9px; }
+.t-adv-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.t-adv-head .muted { flex: 1 1 180px; min-width: 0; }
+.t-adv-head .ghost-btn { padding: 3px 9px; font-size: 10px; }
+.t-adv-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 7px; }
+.t-adv-meta .tag { font-size: 9.5px; }
+.t-adv-meta .muted { margin-left: auto; }
+
+.t-energy { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 8px; }
+.t-energy-cell {
+  border: 1px solid var(--line); border-radius: 9px; padding: 7px 9px;
+  background: rgba(148, 163, 184, .05); display: flex; flex-direction: column; gap: 2px;
+}
+.t-energy-cell .num { font-size: 13px; font-weight: 600; }
+.t-energy-cell .muted { color: var(--text-3); }
+
+.t-adv-list {
+  display: flex; flex-direction: column; gap: 5px; margin-top: 9px;
+  max-height: 330px; overflow-y: auto; padding-right: 3px;
+}
+.t-adv-row {
+  display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap;
+  padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px;
+  background: rgba(255, 255, 255, .022); font-size: 11.5px; color: var(--text-2);
+}
+.t-adv-time { font-size: 10px; color: var(--text-3); }
+.t-adv-arrow { color: var(--text-3); }
+.t-adv-row .tag { font-size: 9.5px; }
+.t-adv-row .t-strength { margin-left: 0; }
+.t-adv-tag { font-size: 10px; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--line); color: var(--text-3); }
+.t-adv-tag.up { color: var(--up); border-color: rgba(255, 80, 99, .28); background: var(--up-soft); }
+.t-adv-tag.down { color: var(--down); border-color: rgba(20, 195, 154, .28); background: var(--down-soft); }
+.t-adv-expect { flex: 1 1 240px; min-width: 0; font-size: 10.5px; color: var(--text-3); line-height: 1.55; }
+.t-adv-prior { font-size: 10px; color: var(--text-3); }
+.t-adv-foot { margin-top: 8px; line-height: 1.7; }
+.t-adv-foot .tag { font-size: 9.5px; margin-left: 4px; }
+
+.t-persona {
+  margin-top: 10px; border: 1px solid rgba(242, 184, 69, .2); border-radius: 10px;
+  padding: 9px 11px; background: rgba(242, 184, 69, .04);
+}
+.t-persona-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.t-persona-head .tag { font-size: 9.5px; }
+.persona-bins { display: flex; align-items: flex-end; gap: 5px; margin: 9px 0 8px; }
+.persona-bin { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 3px; }
+.persona-val { font-size: 9px; color: var(--text-3); line-height: 1; }
+.persona-track {
+  position: relative; width: 100%; height: 46px; border-radius: 4px;
+  background: rgba(148, 163, 184, .08); display: flex; align-items: flex-end; overflow: hidden;
+}
+.persona-track i {
+  display: block; width: 100%; border-radius: 4px 4px 0 0;
+  background: linear-gradient(180deg, var(--gold), rgba(242, 184, 69, .35));
+}
+.persona-tick { font-size: 8.5px; color: var(--text-3); white-space: nowrap; }
+.t-persona-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; margin-bottom: 6px; }
+.t-persona-cell {
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px;
+  background: rgba(148, 163, 184, .05); display: flex; flex-direction: column; gap: 2px;
+}
+.t-persona-cell span { font-size: 9px; color: var(--text-3); }
+.t-persona-cell b { font-size: 14px; font-weight: 600; color: var(--text); }
+
+@media (max-width: 720px) {
+  .t-energy { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .t-persona-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .persona-tick { font-size: 7.5px; }
+}
+
 .val-score {
   display: flex; align-items: center; gap: 10px; padding: 9px 11px; margin-bottom: 9px;
   border: 1px solid rgba(242, 184, 69, .22); border-radius: 10px; background: rgba(242, 184, 69, .05);

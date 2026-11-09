@@ -36,6 +36,7 @@ export const api = {
     }),
   abnormal: () => request("/api/abnormal"),
   tBacktest: (days = 10, force = false) => request(`/api/t/backtest?days=${days}&force=${force}`),
+  tAdvanced: (code, force = false) => request(`/api/t/advanced/${encodeURIComponent(code)}?force=${force}`),
   openBacktest: (days = 20, force = false) => request(`/api/open/backtest?days=${days}&force=${force}`),
   search: (q) => request(`/api/search?q=${encodeURIComponent(q)}`),
   quotes: (codes) => request(`/api/quotes?codes=${codes.map(encodeURIComponent).join(",")}`),
