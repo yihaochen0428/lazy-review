@@ -79,6 +79,8 @@ export default {
       return klineOption(data.value, indicator.value, {
         fib: data.value.fib,
         chan: chanOn.value ? chan.value : null,
+        signals: sigOn.value && signals.value ? signals.value.items : [],
+        signalOn: sigOn.value,
       });
     });
 
@@ -206,6 +208,35 @@ export default {
       return plan.buys.map((p, i) => ({ ...p, type: "buy", mark: `T买${i + 1}` }));
     });
 
+    // 日K量价信号：图上标点 + 右侧独立面板
+    const sigOn = ref(true);
+    const signals = computed(() => (data.value && data.value.signals ? data.value.signals : null));
+    const sigRows = computed(() => {
+      const items = signals.value && signals.value.items ? signals.value.items : [];
+      return items.slice(-8).reverse();
+    });
+    const sigCounts = computed(() => (signals.value && signals.value.counts) || { buy: 0, sell: 0 });
+
+    const sigBt = ref(null);
+    const sigBtLoading = ref(false);
+    const sigBtError = ref("");
+    async function loadSigBt(force = false) {
+      if (sigBtLoading.value) return;
+      if (sigBt.value && !force) return;
+      sigBtLoading.value = true;
+      sigBtError.value = "";
+      try {
+        sigBt.value = await api.kSignalBacktest(60, force);
+      } catch (err) {
+        sigBtError.value = err && err.message ? err.message : String(err);
+      } finally {
+        sigBtLoading.value = false;
+      }
+    }
+    function onSigBtToggle(event) {
+      if (event.target && event.target.open) loadSigBt(false);
+    }
+
     const bt = ref(null);
     const btLoading = ref(false);
     const btError = ref("");
@@ -322,6 +353,7 @@ export default {
       tPoints, financeRows, industryReports, valuationNotes, valDims, tStrategies, chanFuture,
       tEnv, bt, btLoading, btError, loadBt, advice, ob, obLoading, obError, loadOb,
       adv, advLoading, advError, loadAdv, advEnergy, advTone, planLines, planMarks,
+      sigOn, signals, sigRows, sigCounts, sigBt, sigBtLoading, sigBtError, loadSigBt, onSigBtToggle,
       closeStock, switchPeriod, onMask, openStock, fmtAmount, fmtNumber, fmtPct, fmtPrice, tone,
     };
   },
@@ -356,6 +388,7 @@ export default {
                     :class="{active: indicator === m}" :disabled="isIntraday && m !== 'MACD'"
                     @click="indicator = m">{{ m }}</button>
             <button v-if="!isIntraday" class="chip" :class="{active: chanOn}" @click="chanOn = !chanOn">缠论K线</button>
+            <button v-if="!isIntraday" class="chip" :class="{active: sigOn}" @click="sigOn = !sigOn">量价信号</button>
           </div>
 
           <div class="oa-card" v-if="advice">
@@ -829,6 +862,53 @@ export default {
                   <span>{{ f.label }}</span>
                   <span class="num">{{ fmtPrice(f.price) }}</span>
                 </div>
+              </div>
+
+              <div class="sig-box" v-if="signals && !isIntraday">
+                <div class="chan-head">
+                  <b>量价信号</b>
+                  <span class="tag hot" v-if="sigCounts.buy">买 {{ sigCounts.buy }}</span>
+                  <span class="tag cold" v-if="sigCounts.sell">卖 {{ sigCounts.sell }}</span>
+                  <span class="muted small">弱信号图上淡化</span>
+                </div>
+                <div class="sig-sum">{{ signals.summary }}</div>
+                <div class="sig-warn" v-if="signals.caution">{{ signals.caution }}</div>
+                <div class="sig-rows" v-if="sigRows.length">
+                  <div class="sig-row" v-for="s in sigRows" :key="s.date + s.side + s.key">
+                    <div class="sig-line">
+                      <span class="tag" :class="s.side === 'buy' ? 'hot' : 'cold'">{{ s.side === 'buy' ? '买' : '卖' }}</span>
+                      <span class="num muted">{{ s.date.slice(5) }}</span>
+                      <span class="num">{{ fmtPrice(s.price) }}</span>
+                      <span class="sig-type">{{ s.type }}</span>
+                      <span class="num sig-score" :class="s.grade === '强' ? 'up' : (s.grade === '中' ? 'flat' : 'muted')">{{ s.score }}</span>
+                    </div>
+                    <div class="sig-reason">{{ s.reason }}</div>
+                  </div>
+                </div>
+                <div class="muted small" v-else>近期无量价信号</div>
+                <details class="sig-bt" @toggle="onSigBtToggle">
+                  <summary>信号回测（近 60 日 · 短线 + 波段）</summary>
+                  <div class="sig-bt-body" v-if="sigBt">
+                    <div class="sig-stat">
+                      <span>买点样本 {{ sigBt.samples }}</span>
+                      <span>基准 T+5 {{ fmtPct(sigBt.buy.baseline.avg_return) }}（胜率 {{ sigBt.buy.baseline.win_rate === null ? '-' : sigBt.buy.baseline.win_rate + '%' }}）</span>
+                      <span>窗口 {{ sigBt.regime.label }} {{ fmtPct(sigBt.regime.index_chg) }}</span>
+                    </div>
+                    <div class="sig-grade" v-for="(g, name) in sigBt.buy.by_grade" :key="name">
+                      <span class="tag" :class="name === '强' ? 'hot' : ''">{{ name }} {{ g.samples }}</span>
+                      <span class="num">T+5 {{ fmtPct(g.t5.avg_return) }} / {{ g.t5.win_rate === null ? '-' : g.t5.win_rate + '%' }}</span>
+                      <span class="num">波段 {{ fmtPct(g.swing.avg_return) }} / {{ g.swing.win_rate === null ? '-' : g.swing.win_rate + '%' }}（盈亏比 {{ g.swing.payoff === null ? '-' : g.swing.payoff }}）</span>
+                    </div>
+                    <div class="sig-grade" v-if="sigBt.sell.samples">
+                      <span class="tag cold">卖点 {{ sigBt.sell.samples }}</span>
+                      <span class="num">后 5 日下跌 {{ sigBt.sell.after5_down_ratio === null ? '-' : sigBt.sell.after5_down_ratio + '%' }} · 均值 {{ fmtPct(sigBt.sell.after5_avg) }}</span>
+                    </div>
+                    <div class="muted small">{{ sigBt.note }}</div>
+                  </div>
+                  <div class="muted small" v-else-if="sigBtLoading">正在回测…</div>
+                  <div class="sig-warn" v-else-if="sigBtError">{{ sigBtError }}</div>
+                </details>
+                <div class="muted small">{{ signals.note }}</div>
               </div>
 
               <div class="chan-box" v-if="chan">

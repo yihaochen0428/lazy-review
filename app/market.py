@@ -12,6 +12,7 @@ from . import tenv
 from . import tscore
 from . import persona
 from . import dkline
+from . import ksig
 from . import opening
 from . import overview as overview_src
 from . import ths
@@ -492,10 +493,17 @@ def stock_detail(code: str, klt: int = 101):
         chan = chan_src.analyze(bars, m["dif"])
     except Exception:  # noqa: BLE001
         chan = None
+    # 日K量价买卖信号：量价为主、指标共振为辅；盘中跳过未收完的最后一根日K
+    try:
+        signals = ksig.detect(bars, env=ksig.env_score_live(),
+                              skip_last=analysis_phase()[0] == "auction")
+    except Exception:  # noqa: BLE001
+        signals = None
     return {
         "meta": meta,
         "period": klt,
         "bars": bars,
+        "signals": signals,
         "fib": fib_levels(swing_high, swing_low, rising),
         "fib_range": {"high": swing_high, "low": swing_low},
         "indicator": indicator,
@@ -517,6 +525,11 @@ def stock_detail(code: str, klt: int = 101):
 def t_backtest(days: int = 10, force: bool = False):
     """做T策略回测：全信号基准 vs 叠加指数/板块环境后的胜率"""
     return tenv.backtest(days, force, analysis_phase()[0])
+
+
+def k_signal_backtest(days: int = 60, force: bool = False):
+    """日K量价信号回测：短线 T+1/T+3/T+5 + 波段 ATR 止盈止损"""
+    return ksig.backtest(days, force, analysis_phase()[0])
 
 
 def open_backtest(days: int = 20, force: bool = False):

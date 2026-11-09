@@ -192,6 +192,14 @@ def open_backtest(days: int = Query(default=20), force: bool = Query(default=Fal
         return fail(f"开盘策略回测失败：{exc}")
 
 
+@app.get("/api/k/signals/backtest")
+def k_signal_backtest(days: int = Query(default=60), force: bool = Query(default=False)):
+    try:
+        return market.k_signal_backtest(days, force)
+    except Exception as exc:  # noqa: BLE001
+        return fail(f"量价信号回测失败：{exc}")
+
+
 @app.post("/api/news/analyze")
 def news_analyze(item: dict):
     try:
